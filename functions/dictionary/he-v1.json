@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "name": "he-v1",
+  "words": 346469,
+  "sha256": "36533ca92db69928edf86b2414a46aa548348a9c244c2563234b60de10c8fefc",
+  "minLetters": 3,
+  "maxLetters": 15,
+  "sources": {
+    "hspell": "1.4 (AGPL v3)",
+    "wikidata": "Hebrew lexeme forms (CC0)",
+    "wiktionary": "hewiktionary titles (CC-BY-SA 4.0)",
+    "catalog": "patzekhna"
+  },
+  "counts": {
+    "hspell": [
+      341585,
+      339184
+    ],
+    "wiktionary": [
+      4738,
+      46
+    ],
+    "wikidata": [
+      817,
+      0
+    ],
+    "catalog": [
+      587,
+      75
+    ],
+    "variants": 1726,
+    "allow": 5,
+    "deny": 0,
+    "total": 346469,
+    "missing": 20907
+  }
+}

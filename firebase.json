@@ -1,0 +1,17 @@
+{
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "table",
+      "ignore": ["node_modules", ".git", "test", "scripts", "*.log"]
+    }
+  ],
+  "emulators": {
+    "functions": { "port": 5021 },
+    "firestore": { "port": 8099, "websocketPort": 9169 },
+    "hub": { "port": 4419 },
+    "logging": { "port": 4519 },
+    "ui": { "enabled": false },
+    "singleProjectMode": true
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "patzekhna-word-table",
+  "private": true,
+  "version": "1.0.0",
+  "description": "The server of שולחן מילים, the word table in the פצח־נא game: rules, turns, the Hebrew dictionary and the table's votes.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "build:dictionary": "python3 -I scripts/build_dictionary.py"
+  },
+  "dependencies": {
+    "firebase-admin": "^14.4.0",
+    "firebase-functions": "^7.3.2"
+  },
+  "devDependencies": {
+    "firebase": "^12.19.0"
+  }
+}

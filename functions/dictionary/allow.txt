@@ -1,0 +1,7 @@
+# Words added by hand after review (TABLE_DICTIONARY.md). One per line; lines starting with # are notes.
+# Common spellings Hspell lacks and the frequency rule could not tell from a name:
+אמיתי
+אמיתית
+אמיתיים
+אמיתיות
+להנות
