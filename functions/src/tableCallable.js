@@ -8,23 +8,41 @@
 //   games/{id}/private/state   the pool and which hand id belongs to which seat. No client reads it.
 //   invites/{code}             a lobby's code → its table, while the lobby is open.
 import {createHash,randomBytes} from 'node:crypto';
-import {getFirestore,FieldValue} from 'firebase-admin/firestore';
+import {getFirestore,FieldValue,Timestamp} from 'firebase-admin/firestore';
 import {onCall,HttpsError} from 'firebase-functions/v2/https';
 import {validatePlayerDetails,validCode,validMatchID,makeCode} from './players.js';
 import {boardNickname} from './nicknames.js';
 import {tableRules,tableSettings,deal,paint,checkPlay,handValue,nextSeat,finalScores,readAsked,tally} from './table.js';
-import {isWord,dictionaryVersion} from './dictionary.js';
+import {dictionaryVersion,withLists,listsFor} from './dictionary.js';
 
-const actions=['create','join','settings','start','draft','play','draw','timeout','leave','away','back','again',
-  'ask','vote','settle'];
+const actions=['create','join','settings','ready','start','draft','play','draw','timeout','leave','away','back','again',
+  'presence','friendPresence',
+  'ask','vote','settle','inviteFriend'];
 // "The table has moved on", not a bad request: the app drops the move and follows the table.
-const stale=['stale','not-your-turn','not-playing','voting'];
+const stale=['stale','not-your-turn','not-playing','voting','starting'];
 
 const newHandId=()=>randomBytes(15).toString('base64url');
 
+// How long a table stays after its last change: every write moves `expireAt` this far ahead, on the table, its hands,
+// its private state and its code, and Firestore's TTL policy on `expireAt` deletes what nobody touched since. A
+// finished, cancelled or abandoned table is gone a month later.
+const keepMs=30*24*60*60_000;
+const expireAt=()=>Timestamp.fromMillis(Date.now()+keepMs);
+const stamp=()=>({updatedAt:FieldValue.serverTimestamp(),expireAt:expireAt()});
+const kept=data=>({...data,expireAt:expireAt()});
+
+// Friends (README.md, "Friends"). A player's inbox is addressed by a hash of their device key, which only their own
+// phone can work out; it listens there for invitations. The server keeps which inbox belongs to which player id in
+// tablePlayers/{env}/players/{id} (no client reads it), written whenever the player opens or joins a table, so a
+// friend can be invited by the id every table already shows.
+export const inboxOf=playerKey=>createHash('sha256').update(`table-inbox:${playerKey}`).digest('hex');
+const playerKeepMs=365*24*60*60_000;
+const inviteRules={perMinute:10,kept:10};
+const presenceLeaseMs=45_000;
+
 function seat(id,details,now) {
   return {id,nickname:details.nickname,platform:details.platform,appVersion:details.appVersion,joinedMs:now,
-    count:0,opened:false,left:false,away:false,missed:0,score:null,value:null};
+    count:0,opened:false,ready:false,left:false,away:false,missed:0,score:null,value:null};
 }
 
 export const table=onCall({region:'europe-west1',maxInstances:10},async request=>{
@@ -48,6 +66,15 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     return games.doc(data.gameId);
   };
   const reply=result=>({ok:true,serverNow:Date.now(),...result});
+  const playerRef=id=>root.collection('players').doc(id);
+  // This phone's inbox address, kept for its friends' invitations.
+  const register=async me=>{
+    await playerRef(player).set({inbox:inboxOf(data.playerKey),nickname:me.nickname,platform:me.platform,seenMs:Date.now(),
+      expireAt:Timestamp.fromMillis(Date.now()+playerKeepMs)},{merge:true});
+  };
+  // The dictionary for this request: the built list with StageAdmin's allow and deny lists on top.
+  let wordCheck=null;
+  const isWord=async()=>wordCheck ??= withLists(await listsFor(db,env));
   const refuse=(code,message=code)=>{ throw new HttpsError(stale.includes(code) ? 'failed-precondition' : 'invalid-argument',message); };
 
   // Reads a table with its private state and every hand, all before any write (Firestore transactions read first).
@@ -83,9 +110,9 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     const expiresMs=now+tableRules.lobbyMs;
     tx.set(ref,{state:'lobby',code,createdMs:now,expiresMs,host:player,settings,seats:[seat(player,me,now)],board:[],
       jokers:{},colors:{},accepted:[],vote:null,dictionary:dictionaryVersion,pool:0,turn:null,draft:null,log:[],passStreak:0,result:null,next:null,previous,round,startedMs:null,
-      finishedMs:null,updatedAt:FieldValue.serverTimestamp()});
-    tx.set(ref.collection('private').doc('state'),{pool:[],handIds:[handId]});
-    tx.set(invite,{gameId:ref.id,expiresMs});
+      finishedMs:null,...stamp()});
+    tx.set(ref.collection('private').doc('state'),kept({pool:[],handIds:[handId]}));
+    tx.set(invite,{gameId:ref.id,expiresMs,expireAt:Timestamp.fromMillis(expiresMs+24*60*60_000)});
     return {gameId:ref.id,code,handId,expiresMs};
   }
 
@@ -123,13 +150,13 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     return taken.length;
   }
   // The table document's writable part, as it is saved after a change.
-  const saved=game=>({...game,updatedAt:FieldValue.serverTimestamp()});
+  const saved=game=>({...game,...stamp()});
 
   // A proposed turn (a play, or the board standing when the clock ran out) against the table's rules.
   function judge(game,hand,seatIndex,proposal) {
     try {
       return checkPlay({board:game.board,jokers:game.jokers,colors:game.colors ?? {},hand,
-        opened:game.seats[seatIndex].opened,settings:game.settings,isWord,accepted:game.accepted ?? []},proposal);
+        opened:game.seats[seatIndex].opened,settings:game.settings,isWord:wordCheck,accepted:game.accepted ?? []},proposal);
     } catch(e) { throw new HttpsError('invalid-argument',e.message); }
   }
   // Puts a good turn on the table; true if the player went out and won.
@@ -163,7 +190,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   function writeHands(tx,t,hands,before) {
     hands.forEach((tiles,i)=>{
       if(before && before[i]===tiles)return;
-      tx.set(t.handRef(i),{tiles,updatedMs:Date.now()});
+      tx.set(t.handRef(i),kept({tiles,updatedMs:Date.now()}));
     });
   }
   // The current turn as the caller sees it: theirs, this number, the table running.
@@ -171,6 +198,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     if(game.state!=='playing')refuse('not-playing');
     if(Number(data.turn)!==game.turn.number)refuse('stale');
     if(game.turn.seat!==seatIndex)refuse('not-your-turn');
+    if(Date.now()<game.turn.startedMs)refuse('starting');
   }
   // Who may vote on a word the player on turn asked about: everyone else still at the table.
   const voters=game=>game.seats.map((s,i)=>i).filter(i=>!game.seats[i].left && i!==game.vote?.by);
@@ -193,14 +221,64 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   }
 
   switch(data.action) {
+  // A short lease says that the whole app is in front, including outside the word table.
+  // Recent close tombstones prevent in-flight opens and pulses from restoring a closed session.
+  case 'presence': {
+    if(!['open','pulse','close'].includes(data.mode) ||
+       typeof data.session!=='string' || !/^[0-9a-f]{32}$/.test(data.session))
+      throw new HttpsError('invalid-argument','Invalid presence');
+    const ref=playerRef(player);
+    let me=null;
+    if(data.mode==='open') {
+      try { me=validatePlayerDetails(data); }
+      catch(e) { throw new HttpsError('invalid-argument',e.message); }
+    }
+    return reply(await db.runTransaction(async tx=>{
+      const old=await tx.get(ref);
+      const now=Date.now();
+      const closed=old.get('closedSessions') ?? [];
+      if(data.mode==='open') {
+        if(closed.includes(data.session))return {online:false};
+        tx.set(ref,{inbox:inboxOf(data.playerKey),nickname:me.nickname,platform:me.platform,
+          seenMs:now,expireAt:Timestamp.fromMillis(now+playerKeepMs),
+          presenceSession:data.session,onlineUntilMs:now+presenceLeaseMs},{merge:true});
+        return {online:true};
+      }
+      if(data.mode==='close') {
+        const closedSessions=[...new Set([...closed,data.session])].slice(-8);
+        if(!old.exists || old.get('presenceSession')===data.session)
+          tx.set(ref,{presenceSession:data.session,closedSessions,onlineUntilMs:0,
+            expireAt:Timestamp.fromMillis(now+playerKeepMs)},{merge:true});
+        else tx.update(ref,{closedSessions});
+        return {online:false};
+      }
+      if(old.get('presenceSession')!==data.session || closed.includes(data.session))
+        return {online:false};
+      tx.update(ref,{onlineUntilMs:now+presenceLeaseMs});
+      return {online:true};
+    }));
+  }
+
+  case 'friendPresence': {
+    const ids=data.friends;
+    if(!Array.isArray(ids) || ids.length>200 || ids.some(id=>typeof id!=='string' || !/^[0-9a-f]{64}$/.test(id)))
+      throw new HttpsError('invalid-argument','Invalid friends');
+    const unique=[...new Set(ids)].filter(id=>id!==player);
+    const docs=unique.length ? await db.getAll(...unique.map(playerRef)) : [];
+    const now=Date.now();
+    return reply({online:docs.filter(doc=>(doc.get('onlineUntilMs') ?? 0)>now).map(doc=>doc.id)});
+  }
+
   case 'create': {
     const me=await details();
+    await register(me);
     const settings=tableSettings(data);
     return reply(await db.runTransaction(tx=>openLobby(tx,me,settings,Date.now())));
   }
 
   case 'join': {
     const me=await details();
+    await register(me);
     if(!validCode(data.code))throw new HttpsError('invalid-argument','Invalid code');
     const invite=root.collection('invites').doc(data.code);
     return reply(await db.runTransaction(async tx=>{
@@ -214,8 +292,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
         t.game.state==='cancelled' ? 'expired' : 'started');
       if(t.game.seats.length>=tableRules.maxPlayers)throw new HttpsError('failed-precondition','full');
       const handId=newHandId();
-      tx.update(ref,{seats:[...t.game.seats,seat(player,me,now)],updatedAt:FieldValue.serverTimestamp()});
-      tx.set(t.privateRef,{...t.secret,handIds:[...t.secret.handIds,handId]});
+      tx.update(ref,{seats:[...t.game.seats,seat(player,me,now)],...stamp()});
+      tx.set(t.privateRef,kept({...t.secret,handIds:[...t.secret.handIds,handId]}));
       return {gameId:ref.id,handId,code:t.game.code};
     }));
   }
@@ -227,8 +305,22 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       if(t.game.host!==player)throw new HttpsError('permission-denied','Only the host');
       if(t.game.state!=='lobby')refuse('not-playing');
       const settings=tableSettings({...t.game.settings,...data});
-      tx.update(ref,{settings,updatedAt:FieldValue.serverTimestamp()});
+      const changed=Object.keys(settings).some(key=>settings[key]!==t.game.settings[key]);
+      tx.update(ref,{settings,seats:changed ? t.game.seats.map(s=>({...s,ready:false})) : t.game.seats,...stamp()});
       return {settings};
+    }));
+  }
+
+  case 'ready': {
+    const ref=gameRef();
+    if(typeof data.ready!=='boolean')throw new HttpsError('invalid-argument','Invalid readiness');
+    return reply(await db.runTransaction(async tx=>{
+      const t=await load(tx,ref);
+      const me=mine(t);
+      if(t.game.state!=='lobby')refuse('not-playing');
+      const seats=t.game.seats.map((s,i)=>i===me ? {...s,ready:data.ready} : s);
+      tx.update(ref,{seats,...stamp()});
+      return {ready:data.ready};
     }));
   }
 
@@ -241,6 +333,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       if(game.host!==player)throw new HttpsError('permission-denied','Only the host');
       if(game.state!=='lobby')return {state:game.state};
       if(game.seats.length<tableRules.minPlayers)throw new HttpsError('failed-precondition','alone');
+      if(game.seats.some(s=>!s.ready))throw new HttpsError('failed-precondition','not-ready');
       const {hands,pool}=deal(game.seats.length,game.settings.rackSize);
       const first=Math.floor(Math.random()*game.seats.length);
       game.state='playing';
@@ -248,10 +341,10 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       game.colors=paint(game.settings.colors ?? 1);
       game.seats=game.seats.map((s,i)=>({...s,count:hands[i].length}));
       game.pool=pool.length;
-      game.turn={number:1,seat:first,startedMs:now,
+      game.turn={number:1,seat:first,startedMs:now+tableRules.startDelayMs,
         endsAt:now+tableRules.startDelayMs+game.settings.turnSeconds*1000};
       tx.set(ref,saved(game));
-      tx.set(t.privateRef,{...t.secret,pool});
+      tx.set(t.privateRef,kept({...t.secret,pool}));
       writeHands(tx,t,hands);
       tx.delete(root.collection('invites').doc(game.code));
       return {state:'playing'};
@@ -267,13 +360,14 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       onTurn(t.game,mine(t));
       const shape=judge(t.game,t.hands[t.me],t.me,data);
       tx.update(ref,{draft:{turn:t.game.turn.number,board:shape.board,jokers:shape.jokers,at:now},
-        updatedAt:FieldValue.serverTimestamp()});
+        ...stamp()});
       return {};
     }));
   }
 
   case 'play': {
     const ref=gameRef();
+    await isWord();
     return reply(await db.runTransaction(async tx=>{
       const now=Date.now();
       const t=await load(tx,ref,{hands:true});
@@ -305,7 +399,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       game.seats[me]={...game.seats[me],missed:0};
       if(!drawOrPass(game,hands,t.secret,me,now))advance(game,now);
       tx.set(ref,saved(game));
-      tx.set(t.privateRef,t.secret);
+      tx.set(t.privateRef,kept(t.secret));
       writeHands(tx,t,hands,t.hands);
       return {state:game.state};
     }));
@@ -317,6 +411,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   // its app gone is out.
   case 'timeout': {
     const ref=gameRef();
+    await isWord();
     return reply(await db.runTransaction(async tx=>{
       const now=Date.now();
       const t=await load(tx,ref,{hands:true});
@@ -358,7 +453,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       }
       if(!over)advance(game,now);
       tx.set(ref,saved(game));
-      tx.set(t.privateRef,t.secret);
+      tx.set(t.privateRef,kept(t.secret));
       writeHands(tx,t,hands,t.hands);
       return {state:game.state};
     }));
@@ -379,12 +474,12 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
         const seats=game.seats.filter((s,i)=>i!==me);
         const handIds=t.secret.handIds.filter((h,i)=>i!==me);
         if(!seats.length) {
-          tx.update(ref,{seats,state:'cancelled',finishedMs:now,updatedAt:FieldValue.serverTimestamp()});
+          tx.update(ref,{seats,state:'cancelled',finishedMs:now,...stamp()});
           tx.delete(invite);
         } else {
-          tx.update(ref,{seats,host:game.host===player ? seats[0].id : game.host,updatedAt:FieldValue.serverTimestamp()});
+          tx.update(ref,{seats,host:game.host===player ? seats[0].id : game.host,...stamp()});
         }
-        tx.set(t.privateRef,{...t.secret,handIds});
+        tx.set(t.privateRef,kept({...t.secret,handIds}));
         return {state:seats.length ? 'lobby' : 'cancelled'};
       }
       if(game.state==='playing') {
@@ -398,7 +493,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       }
       if(game.state==='finished' && !game.seats[me].left) {
         game.seats[me]={...game.seats[me],left:true};
-        tx.update(ref,{seats:game.seats,updatedAt:FieldValue.serverTimestamp()});
+        tx.update(ref,{seats:game.seats,...stamp()});
       }
       return {state:game.state};
     }));
@@ -413,7 +508,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       const away=data.action==='away';
       if(t.game.seats[me].away===away || !['lobby','playing'].includes(t.game.state))return {state:t.game.state};
       const seats=t.game.seats.map((s,i)=>i===me ? {...s,away} : s);
-      tx.update(ref,{seats,updatedAt:FieldValue.serverTimestamp()});
+      tx.update(ref,{seats,...stamp()});
       return {state:t.game.state};
     }));
   }
@@ -422,6 +517,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   // turn's clock stops for the vote and takes up where it left off when the vote is settled.
   case 'ask': {
     const ref=gameRef();
+    await isWord();
     return reply(await db.runTransaction(async tx=>{
       const now=Date.now();
       const t=await load(tx,ref);
@@ -431,7 +527,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       if(game.turn.asked)throw new HttpsError('failed-precondition','asked');
       if(now>game.turn.endsAt)refuse('stale','Time is up');
       let words;
-      try { words=readAsked(data.words,isWord,game.accepted ?? []); }
+      try { words=readAsked(data.words,wordCheck,game.accepted ?? []); }
       catch(e) { throw new HttpsError('invalid-argument',e.message); }
       const left=Math.max(5_000,game.turn.endsAt-now);
       const endsAt=now+tableRules.voteMs;
@@ -481,10 +577,45 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     }));
   }
 
+  // A friend asked to this lobby: the invitation lands in their inbox with the code, and their app shows it wherever
+  // they are. Anyone seated may invite, while the table is still a lobby with a free seat. A friend the server has never
+  // seen (no table yet) cannot be reached.
+  case 'inviteFriend': {
+    const me=await details();
+    await register(me);
+    const ref=gameRef();
+    const friend=data.friend;
+    if(typeof friend!=='string' || !/^[0-9a-f]{64}$/.test(friend) || friend===player)
+      throw new HttpsError('invalid-argument','Invalid friend');
+    return reply(await db.runTransaction(async tx=>{
+      const now=Date.now();
+      const t=await load(tx,ref);
+      mine(t);
+      const game=t.game;
+      if(game.state!=='lobby')throw new HttpsError('failed-precondition','started');
+      if(game.seats.some(s=>s.id===friend))throw new HttpsError('failed-precondition','seated');
+      if(game.seats.length>=tableRules.maxPlayers)throw new HttpsError('failed-precondition','full');
+      const [friendDoc,meDoc]=await tx.getAll(playerRef(friend),playerRef(player));
+      const inbox=friendDoc.get('inbox');
+      if(!friendDoc.exists || typeof inbox!=='string')throw new HttpsError('not-found','unknown-friend');
+      const recent=(meDoc.get('invitesSent') ?? []).filter(ms=>ms>now-60_000);
+      if(recent.length>=inviteRules.perMinute)throw new HttpsError('resource-exhausted','too-many');
+      const inboxRef=root.collection('inboxes').doc(inbox);
+      const old=((await tx.get(inboxRef)).get('invites') ?? []).filter(i=>i.expiresMs>now && i.gameId!==ref.id);
+      const invite={id:randomBytes(9).toString('base64url'),gameId:ref.id,code:game.code,from:me.nickname,fromId:player,
+        players:game.seats.length,sentMs:now,expiresMs:game.expiresMs ?? now+tableRules.lobbyMs};
+      tx.set(inboxRef,{invites:[...old,invite].slice(-inviteRules.kept),updatedMs:now,
+        expireAt:Timestamp.fromMillis(invite.expiresMs+24*60*60_000)});
+      tx.set(playerRef(player),{invitesSent:[...recent,now]},{merge:true});
+      return {sent:true};
+    }));
+  }
+
   // "עוד משחק" after the end: the first to ask opens a new lobby with the same settings and points the old table to
   // it; everyone after joins that lobby.
   case 'again': {
     const me=await details();
+    await register(me);
     const ref=gameRef();
     return reply(await db.runTransaction(async tx=>{
       const now=Date.now();
@@ -498,12 +629,12 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
         if(n.game.state!=='lobby')throw new HttpsError('failed-precondition','started');
         if(n.game.seats.length>=tableRules.maxPlayers)throw new HttpsError('failed-precondition','full');
         const handId=newHandId();
-        tx.update(nextRef,{seats:[...n.game.seats,seat(player,me,now)],updatedAt:FieldValue.serverTimestamp()});
-        tx.set(n.privateRef,{...n.secret,handIds:[...n.secret.handIds,handId]});
+        tx.update(nextRef,{seats:[...n.game.seats,seat(player,me,now)],...stamp()});
+        tx.set(n.privateRef,kept({...n.secret,handIds:[...n.secret.handIds,handId]}));
         return {gameId:nextRef.id,handId,code:n.game.code};
       }
       const lobby=await openLobby(tx,me,t.game.settings,now,ref.id,(t.game.round ?? 1)+1);
-      tx.update(ref,{next:lobby.gameId,updatedAt:FieldValue.serverTimestamp()});
+      tx.update(ref,{next:lobby.gameId,...stamp()});
       return lobby;
     }));
   }

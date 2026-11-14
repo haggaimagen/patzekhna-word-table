@@ -1,6 +1,6 @@
-# שולחן מילים — the word table of פצח־נא
+# רמילים — the word table of פצח־נא
 
-The server of **שולחן מילים** ("the word table"), a mode of the Hebrew word game
+The server of **רמילים** ("the word table"), a mode of the Hebrew word game
 [פצח־נא](https://patzekhna.web.app). It's rummy with letters: 2–4 friends share
 one board of Hebrew words. On your turn you build new words from your letters,
 extend words on the board, cut them in two and move letters between them.
@@ -19,6 +19,7 @@ AGPL. The game's apps are separate programs that talk to this server.
 ## The rules in short
 
 - **Tiles:** 106 tiles: 104 Hebrew letters by how often Hebrew uses them, and 2 jokers. Each player gets 7–21 letters (14 by default).
+- **Starting:** every seated player must mark themselves ready. Changing the table settings clears readiness. The host can start when at least two players are seated and all are ready; everyone sees a shared 3-second countdown before the first turn.
 - **Finals:** there are no final-form tiles. ך ם ן ף ץ show by themselves at the end of a word.
 - **Opening:** your first move must be worth at least 10 points of your own letters, in new words only.
 - **A turn ends** with at least one of your letters placed, and every word on the board 3+ letters long, one colour (when the table plays with colours), and in the dictionary.
@@ -47,6 +48,13 @@ final forms written as regular letters (שלום → שלומ), 3–15 letters e
 | The game's own catalog | — | Every word the game has used |
 | `dictionary/allow.txt`, `dictionary/deny.txt` | — | Decisions made by hand after review |
 
+On top of the built list, the server reads `dictionaryLists/{env}` from
+Firestore, cached for a minute. That document holds `allow` and `deny` arrays
+of keys, kept by the game's admin tool from the review queue. A denied key is
+never a word, and an allowed one always is, with no rebuild. Every word a table
+votes on is logged once in `wordReviews/{env}/words/{key}` (its text, how many
+tables asked, how many accepted, and the last vote), for that review.
+
 To rebuild it on a Mac:
 
 ```bash
@@ -69,6 +77,21 @@ Where the inputs come from:
 | `catalog.json` | The game's published catalog |
 
 The script prints the counts at each step and writes samples for review.
+
+## Friends
+
+A player can invite friends to a lobby without a code. Each player has an inbox,
+`tables/{env}/inboxes/{inbox}`, where `inbox` is the SHA-256 of `table-inbox:`
+followed by their device key: only their own phone can work out that address.
+- The server keeps which inbox belongs to which player id in `tables/{env}/players/{id}`, which no client reads. It writes it whenever the player opens or joins a table.
+- `inviteFriend {gameId, friend}` adds an invitation (the code, who sent it, when it ends) to the friend's inbox, at most 10 a minute per sender.
+- `presence {mode, session}` publishes an app-wide foreground lease: `open` registers the player, `pulse` renews it, and `close` clears it on background. A lost close expires after 45 seconds. `friendPresence {friends}` returns only the IDs currently online; the apps check while the friend list or lobby is visible.
+
+## How long things are kept
+
+Every write moves `expireAt` 30 days ahead on a table, its hands, its private state
+and its code; a player's inbox record keeps for a year. A Firestore TTL policy on
+`expireAt` deletes what has expired.
 
 ## Running it
 

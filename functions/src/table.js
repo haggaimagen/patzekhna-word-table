@@ -26,7 +26,7 @@ export const tileOf=id=>TILE.get(id);
 export const tableRules={minPlayers:2,maxPlayers:4,minWordLength:3,openingPoints:10,timeoutPenalty:3,jokerHandPenalty:8,
   rackSizes:[7,10,12,14,16,18,21],rackSize:14,turnSecondsOptions:[30,60,90,120],turnSeconds:60,
   colorOptions:[1,2,3,4],colors:1,colorChance:0.5,
-  lobbyMs:30*60_000,startDelayMs:2_000,graceMs:2_500,maxMissed:3,maxWords:60,maxWordTiles:24,logSize:30,
+  lobbyMs:30*60_000,startDelayMs:3_000,graceMs:2_500,maxMissed:3,maxWords:60,maxWordTiles:24,logSize:30,
   voteMs:15_000,maxAsked:3};
 
 export function tableSettings(input={}) {
@@ -171,15 +171,15 @@ export function nextSeat(seats,seat) {
 
 // The end, as in the original: everyone loses what is left in hand, and the winner collects the others' total.
 // `winner` null means the pool ran out and a full round passed: the lowest hand wins (the earliest seat on a tie).
-// A seat that left scores nothing and cannot win.
+// A seat that left (or was dropped) cannot win, and pays its hand like any loser: leaving is a forfeit, not a way out.
 export function finalScores(seats,values,winner) {
   if(winner==null) {
     let best=null;
     seats.forEach((s,i)=>{ if(!s.left && (best==null || values[i]<values[best]))best=i; });
     winner=best;
   }
-  const others=values.reduce((sum,v,i)=>i===winner || seats[i].left ? sum : sum+v,0);
-  const scores=values.map((v,i)=>seats[i].left ? 0 : i===winner ? others-v : -v);
+  const others=values.reduce((sum,v,i)=>i===winner ? sum : sum+v,0);
+  const scores=values.map((v,i)=>i===winner ? others-v : -v);
   return {winner,scores};
 }
 

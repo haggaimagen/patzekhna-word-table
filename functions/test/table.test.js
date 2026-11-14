@@ -4,7 +4,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {TILES,ALPHABET,tileOf,tableRules,tableSettings,deal,paint,colorOf,wordText,wordKey,checkPlay,handValue,nextSeat,
   finalScores,readBoard,readAsked,tally} from '../src/table.js';
-import {isWord,dictionarySize,dictionaryVersion} from '../src/dictionary.js';
+import {isWord,dictionarySize,dictionaryVersion,withLists} from '../src/dictionary.js';
 
 // Tile ids by letter, in box order: ids('ש',2) → the first two ש tiles.
 const ids=(letter,n=1,skip=0)=>TILES.filter(t=>t.letter===letter).slice(skip,skip+n).map(t=>t.id);
@@ -125,11 +125,13 @@ test('turn order skips seats that left', ()=>{
   assert.equal(nextSeat([{left:false},{left:true}],0),0);
 });
 
-test('scores: losers pay their hand, the winner collects; blocked → the lowest hand', ()=>{
+test('scores: losers pay their hand (leavers too), the winner collects; blocked → the lowest hand', ()=>{
   const seats=[{left:false},{left:false},{left:false}];
   assert.deepEqual(finalScores(seats,[0,5,7],0),{winner:0,scores:[12,-5,-7]});
   assert.deepEqual(finalScores(seats,[6,3,7],null),{winner:1,scores:[-6,10,-7]});
-  assert.deepEqual(finalScores([{left:false},{left:true}],[4,1],null),{winner:0,scores:[-4,0]});
+  // A seat that left can't win but pays its hand, and the winner collects it.
+  assert.deepEqual(finalScores([{left:false},{left:true}],[4,1],null),{winner:0,scores:[-3,-1]});
+  assert.deepEqual(finalScores([{left:false},{left:true},{left:false}],[2,9,5],0),{winner:0,scores:[12,-9,-5]});
   assert.equal(handValue([JOKER]),tableRules.jokerHandPenalty);
   assert.equal(handValue(ids('ז')),4);
   assert.equal(tileOf('t0').value,1);
@@ -203,4 +205,13 @@ test('asking the table: up to three unknown words; a majority of all who may vot
   assert.deepEqual(tally(vote,[1,2]).accepted.map(w=>w.key),['א1']);     // 2 of 2, and 1 of 2 is a tie
   assert.deepEqual(tally({words:[{key:'א1'}],votes:{'1':['א1']}},[1]).accepted.length,1);
   assert.deepEqual(tally({words:[{key:'א1'}],votes:{}},[1]).accepted.length,0);
+});
+
+test('review decisions on top of the list: deny wins, allow adds', ()=>{
+  const check=withLists({allow:['בבבב'],deny:['שלומ']});
+  assert.equal(check('בבבב'),true);
+  assert.equal(check('שלומ'),false);
+  assert.equal(check('בית'),true);
+  assert.equal(withLists({allow:['בית'],deny:['בית']})('בית'),false);
+  assert.equal(withLists(null)('בית'),true);
 });

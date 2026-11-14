@@ -8,6 +8,7 @@ import {getFunctions,connectFunctionsEmulator,httpsCallable} from 'firebase/func
 import {initializeApp as adminApp,deleteApp as deleteAdminApp} from 'firebase-admin/app';
 import {getFirestore} from 'firebase-admin/firestore';
 import {TILES} from '../src/table.js';
+import {inboxOf} from '../src/tableCallable.js';
 
 if(!process.env.FIRESTORE_EMULATOR_HOST)throw Error('Emulator endpoints are required');
 const admin=adminApp({projectId:'patzekhna'},'table-integration');
@@ -26,6 +27,14 @@ const table=async(who,action,extra={})=>(await call({...who,action,...extra})).d
 const game=async gameId=>(await db.doc(`tables/${env}/games/${gameId}`).get()).data();
 const hand=async(gameId,handId)=>(await db.doc(`tables/${env}/games/${gameId}/hands/${handId}`).get()).get('tiles');
 const fails=(promise,code,message)=>assert.rejects(promise,e=>e.code===`functions/${code}` && (!message || e.message.includes(message)));
+const ready=async(who,gameId,value=true)=>table(who,'ready',{gameId,ready:value});
+async function startNow(host,other,gameId) {
+  await ready(host,gameId);
+  await ready(other,gameId);
+  await table(host,'start',{gameId});
+  // These tests exercise turns, so advance the emulator's shared start clock past the countdown.
+  await db.doc(`tables/${env}/games/${gameId}`).update({'turn.startedMs':Date.now()-1});
+}
 const spell=(word,used)=>[...word].map(l=>{
   const t=TILES.find(t=>t.letter===l && !used.has(t.id));
   used.add(t.id);
@@ -63,6 +72,9 @@ test('a lobby fills by code, the host starts, and each hand stays private',async
   assert.deepEqual(await table(b,'join',{code:made.code}).then(r=>r.handId),joined.handId,'joining twice keeps the seat');
   await fails(table(a,'join',{code:'ZZZZZZ'}),'not-found');
   await fails(table(b,'start',{gameId:made.gameId}),'permission-denied');
+  await fails(table(a,'start',{gameId:made.gameId}),'failed-precondition','not-ready');
+  await ready(a,made.gameId);
+  await ready(b,made.gameId);
   await table(a,'settings',{gameId:made.gameId,rackSize:7,colors:3});
   await table(c,'join',{code:made.code});
   await table(c,'leave',{gameId:made.gameId});
@@ -71,9 +83,15 @@ test('a lobby fills by code, the host starts, and each hand stays private',async
   assert.equal(g.settings.rackSize,7);
   assert.equal(g.settings.turnSeconds,90);
   assert.equal(g.settings.colors,3);
+  assert.deepEqual(g.seats.map(s=>s.ready),[false,false],'settings changes clear consent');
+  await ready(a,made.gameId);
+  await fails(table(a,'start',{gameId:made.gameId}),'failed-precondition','not-ready');
+  await ready(b,made.gameId);
   await table(a,'start',{gameId:made.gameId});
   g=await game(made.gameId);
   assert.equal(g.state,'playing');
+  assert.equal(g.turn.startedMs-g.startedMs,3_000,'the countdown is three seconds on the server clock');
+  assert.ok(g.turn.startedMs>Date.now(),'all phones get a countdown before the first turn');
   assert.equal(g.pool,106-14);
   assert.deepEqual(g.seats.map(s=>s.count),[7,7]);
   assert.ok(Object.keys(g.colors).length>20,'about half the letters painted');
@@ -87,7 +105,7 @@ test('turns: an opening play, a draw, a broken board at timeout, leaving ends th
   const a=player(key('d'),'נמר'), b=player(key('e'),'צבי');
   const made=await table(a,'create',{});
   const joined=await table(b,'join',{code:made.code});
-  await table(a,'start',{gameId:made.gameId});
+  await startNow(a,b,made.gameId);
   let g=await game(made.gameId);
   const seats={[g.seats[0].id]:{who:a,handId:made.handId},[g.seats[1].id]:{who:b,handId:joined.handId}};
   const on=()=>seats[g.seats[g.turn.seat].id];
@@ -152,7 +170,7 @@ test('the player out of tiles wins and the others pay their hands',async()=>{
   const a=player(key('f'),'ארנב'), b=player(key('9'),'חתול');
   const made=await table(a,'create',{rackSize:7});
   const joined=await table(b,'join',{code:made.code});
-  await table(a,'start',{gameId:made.gameId});
+  await startNow(a,b,made.gameId);
   let g=await game(made.gameId);
   const on=g.seats[g.turn.seat].id===id(a.playerKey) ? {who:a,handId:made.handId} : {who:b,handId:joined.handId};
   const used=new Set();
@@ -171,7 +189,7 @@ test('asking the table: the clock stops, a majority accepts, and the word then p
   const a=player(key('7'),'ינשוף'), b=player(key('8'),'עורב');
   const made=await table(a,'create',{});
   const joined=await table(b,'join',{code:made.code});
-  await table(a,'start',{gameId:made.gameId});
+  await startNow(a,b,made.gameId);
   let g=await game(made.gameId);
   const on=g.seats[g.turn.seat].id===id(a.playerKey) ? {who:a,handId:made.handId} : {who:b,handId:joined.handId};
   const off=on.who===a ? b : a;
@@ -204,4 +222,70 @@ test('asking the table: the clock stops, a majority accepts, and the word then p
   assert.equal(g.state,'finished');
   assert.equal(g.result.reason,'empty');
   assert.equal(g.board.length,3);
+});
+
+test("StageAdmin's lists: a denied word is refused, an allowed one plays",async()=>{
+  await db.doc(`dictionaryLists/${env}`).set({allow:['דדדד'],deny:['שלומ']});
+  const a=player(key('5'),'צבי'), b=player(key('6'),'איל');
+  const made=await table(a,'create',{});
+  const joined=await table(b,'join',{code:made.code});
+  await startNow(a,b,made.gameId);
+  const g=await game(made.gameId);
+  const on=g.seats[g.turn.seat].id===id(a.playerKey) ? {who:a,handId:made.handId} : {who:b,handId:joined.handId};
+  const used=new Set();
+  const allowed=spell('דדדד',used), shalom=spell('שלומ',used), sefer=spell('ספר',used);
+  await giveHand(made.gameId,on.handId,[...allowed,...shalom,...sefer]);
+  await fails(table(on.who,'play',{gameId:made.gameId,turn:1,
+    board:[{id:'w1',tiles:allowed},{id:'w2',tiles:shalom},{id:'w3',tiles:sefer}]}),'failed-precondition','unknown');
+  await table(on.who,'play',{gameId:made.gameId,turn:1,board:[{id:'w1',tiles:allowed},{id:'w3',tiles:sefer}]});
+  assert.equal((await game(made.gameId)).turn.number,2);
+  await db.doc(`dictionaryLists/${env}`).delete();
+});
+
+test('friends: an invitation lands in the friend\'s own inbox with the code',async()=>{
+  const a=player(key('3'),'דבורה'), b=player(key('4'),'נחליאלי'), c=player(key('2'),'זר');
+  // b has been at a table before, so the server knows b's inbox.
+  const earlier=await table(b,'create',{});
+  await table(b,'leave',{gameId:earlier.gameId});
+  const made=await table(a,'create',{});
+  await fails(table(a,'inviteFriend',{gameId:made.gameId,friend:id(key('9').replace(/9/g,'1'))}),'not-found','unknown-friend');
+  await fails(table(a,'inviteFriend',{gameId:made.gameId,friend:id(a.playerKey)}),'invalid-argument');
+  await table(a,'inviteFriend',{gameId:made.gameId,friend:id(b.playerKey)});
+  const inbox=(await db.doc(`tables/${env}/inboxes/${inboxOf(b.playerKey)}`).get()).data();
+  assert.equal(inbox.invites.length,1);
+  assert.equal(inbox.invites[0].code,made.code);
+  assert.equal(inbox.invites[0].from,'דבורה');
+  assert.equal(inbox.invites[0].fromId,id(a.playerKey));
+  assert.equal(JSON.stringify(inbox).includes(b.playerKey),false,'the key itself is never stored');
+  // Someone not at the table cannot invite from it.
+  await fails(table(c,'inviteFriend',{gameId:made.gameId,friend:id(b.playerKey)}),'permission-denied');
+  await table(b,'join',{code:made.code});
+  await fails(table(a,'inviteFriend',{gameId:made.gameId,friend:id(b.playerKey)}),'failed-precondition','seated');
+  const g=await game(made.gameId);
+  assert.ok(g.expireAt,'a table carries its expiry');
+});
+
+test('friends: presence follows the foreground session and expires without a close',async()=>{
+  const a=player(key('5'),'צופה'), b=player(key('6'),'חבר');
+  const aId=id(a.playerKey), bId=id(b.playerKey);
+  const first='1'.repeat(32), second='2'.repeat(32), late='3'.repeat(32);
+  const online=async()=> (await table(a,'friendPresence',{friends:[bId,aId]})).online;
+  assert.deepEqual(await online(),[]);
+  await table(b,'presence',{mode:'open',session:first});
+  assert.deepEqual(await online(),[bId]);
+  await table(b,'presence',{mode:'pulse',session:first});
+  await table(b,'presence',{mode:'close',session:first});
+  assert.deepEqual(await online(),[]);
+  await table(b,'presence',{mode:'pulse',session:first});
+  await table(b,'presence',{mode:'open',session:first});
+  assert.deepEqual(await online(),[],'a closed session cannot come back from an in-flight call');
+  await table(b,'presence',{mode:'open',session:second});
+  await table(b,'presence',{mode:'close',session:late});
+  await table(b,'presence',{mode:'open',session:late});
+  assert.deepEqual(await online(),[bId],'a delayed open after its close cannot replace the current session');
+  await table(b,'presence',{mode:'close',session:first});
+  assert.deepEqual(await online(),[bId],'an old close cannot hide a newer session');
+  await db.doc(`tables/${env}/players/${bId}`).update({onlineUntilMs:Date.now()-1});
+  assert.deepEqual(await online(),[],'a crashed phone goes offline when its lease ends');
+  await fails(table(a,'friendPresence',{friends:['bad']}),'invalid-argument');
 });
