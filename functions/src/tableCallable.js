@@ -12,8 +12,10 @@ import {getFirestore,FieldValue,Timestamp} from 'firebase-admin/firestore';
 import {onCall,HttpsError} from 'firebase-functions/v2/https';
 import {validatePlayerDetails,validCode,validMatchID,makeCode} from './players.js';
 import {boardNickname} from './nicknames.js';
-import {tableRules,tableSettings,deal,paint,checkPlay,handValue,nextSeat,finalScores,readAsked,tally} from './table.js';
+import {tableRules,tableSettings,tableTuning,chooseStake,payouts,deal,paint,checkPlay,handValue,nextSeat,finalScores,readAsked,tally}
+  from './table.js';
 import {dictionaryVersion,withLists,listsFor} from './dictionary.js';
+import {statsDay,newTally,statsKey} from './stats.js';
 
 const actions=['create','join','settings','ready','start','draft','play','draw','timeout','leave','away','back','again',
   'presence','friendPresence',
@@ -39,6 +41,21 @@ export const inboxOf=playerKey=>createHash('sha256').update(`table-inbox:${playe
 const playerKeepMs=365*24*60*60_000;
 const inviteRules={perMinute:10,kept:10};
 const presenceLeaseMs=45_000;
+
+// The game's settings for prices (table.js, `tableTuning`): read once a minute per instance, every time in the emulator.
+const tuningCache=new Map();
+async function tuningFor(db,env) {
+  const hit=tuningCache.get(env);
+  if(hit && Date.now()-hit.at<60_000 && process.env.FUNCTIONS_EMULATOR!=='true')return hit.tuning;
+  let payload=null;
+  try {
+    const doc=await db.collection('gameTuning').doc(env).get();
+    payload=doc.exists ? JSON.parse(doc.get('payload')) : null;
+  } catch { payload=null; }
+  const tuning=tableTuning(payload);
+  tuningCache.set(env,{at:Date.now(),tuning});
+  return tuning;
+}
 
 function seat(id,details,now) {
   return {id,nickname:details.nickname,platform:details.platform,appVersion:details.appVersion,joinedMs:now,
@@ -75,7 +92,25 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   // The dictionary for this request: the built list with StageAdmin's allow and deny lists on top.
   let wordCheck=null;
   const isWord=async()=>wordCheck ??= withLists(await listsFor(db,env));
+  // Daily aggregated statistics (stats.js): each transaction attempt gathers its counts and writes them once.
+  let tallied=newTally();
+  const count=(path,n=1)=>tallied.add(path,n);
+  const statsRef=()=>db.collection('tableStats').doc(env).collection('days').doc(statsDay());
+  const runTx=fn=>db.runTransaction(async tx=>{
+    tallied=newTally();
+    const result=await fn(tx);
+    if(tallied.size)tx.set(statsRef(),{day:statsDay(),updatedMs:Date.now(),...tallied.update(n=>FieldValue.increment(n))},{merge:true});
+    return result;
+  });
   const refuse=(code,message=code)=>{ throw new HttpsError(stale.includes(code) ? 'failed-precondition' : 'invalid-argument',message); };
+  // Diamonds live on the phones (the game's DIAMONDS.md), so each call says what its player has. A table with a price
+  // takes only players whose balance covers it; an app from before prices sends none and is told to update.
+  const balance=Number.isInteger(data.balance) && data.balance>=0 ? data.balance : undefined;
+  const covers=stake=>{
+    if(!stake)return;
+    if(balance===undefined)throw new HttpsError('failed-precondition','update');
+    if(balance<stake)throw new HttpsError('failed-precondition','diamonds',{stake,balance});
+  };
 
   // Reads a table with its private state and every hand, all before any write (Firestore transactions read first).
   async function load(tx,ref,{hands=false}={}) {
@@ -113,6 +148,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       finishedMs:null,...stamp()});
     tx.set(ref.collection('private').doc('state'),kept({pool:[],handIds:[handId]}));
     tx.set(invite,{gameId:ref.id,expiresMs,expireAt:Timestamp.fromMillis(expiresMs+24*60*60_000)});
+    count('tablesCreated');
+    if(previous)count('againTables');
     return {gameId:ref.id,code,handId,expiresMs};
   }
 
@@ -129,12 +166,21 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   function finish(game,hands,winner,reason,now) {
     const values=game.seats.map((s,i)=>handValue(hands[i] ?? []));
     const result=finalScores(game.seats,values,winner);
+    const pay=payouts(game.seats,game.settings.stake ?? 0,game.houseCut ?? 0,result.winner);
     game.seats=game.seats.map((s,i)=>({...s,score:result.scores[i],value:values[i]}));
     game.state='finished';
-    game.result={winner:result.winner,reason,values};
+    game.result={winner:result.winner,reason,values,pot:pay.pot,payouts:pay.payouts};
+    if(pay.pot) {
+      count('diamondsCut',pay.cut);
+      count('diamondsPaidOut',pay.payouts.reduce((a,b)=>a+b,0));
+    }
     game.finishedMs=now;
     game.draft=null;
     log(game,{type:'end',seat:result.winner,reason},now);
+    count('gamesFinished');
+    count(`ends.${statsKey(reason)}`);
+    if(game.startedMs)count('durationMsSum',Math.max(0,now-game.startedMs));
+    count('turnsSum',game.turn?.number ?? 0);
   }
   // Ends the table if fewer than two are still in; true if it did.
   function lastOneStanding(game,hands,now) {
@@ -171,6 +217,10 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     game.seats[seatIndex]={...game.seats[seatIndex],opened:true,count:result.hand.length,missed:0};
     game.passStreak=0;
     log(game,{type,seat:seatIndex,tiles:result.played.length,words:result.words.slice(0,8),opening},now);
+    count(type==='play' ? 'plays' : 'timeoutPlays');
+    count('tilesPlayed',result.played.length);
+    count('wordsMade',result.words.length);
+    if(opening)count('openings');
     if(result.hand.length===0) { finish(game,hands,seatIndex,'empty',now); return true; }
     return false;
   }
@@ -181,7 +231,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     hands[seatIndex]=hand;
     game.seats[seatIndex]={...game.seats[seatIndex],count:hand.length};
     game.pool=secret.pool.length;
-    if(got) { game.passStreak=0; log(game,{type,seat:seatIndex,count:1},now); return false; }
+    if(got) { game.passStreak=0; log(game,{type,seat:seatIndex,count:1},now); count(type==='draw' ? 'draws' : 'timeoutDraws'); return false; }
+    count('passes');
     game.passStreak=(game.passStreak ?? 0)+1;
     log(game,{type:'pass',seat:seatIndex},now);
     if(game.passStreak>=game.seats.filter(s=>!s.left).length) { finish(game,hands,null,'blocked',now); return true; }
@@ -212,6 +263,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     game.turn={...game.turn,endsAt:now+vote.left};
     game.vote=null;
     log(game,{type:'vote',seat:vote.by,accepted:accepted.map(w=>w.text),rejected:rejected.map(w=>w.text)},now);
+    count('wordsAccepted',accepted.length);
+    count('wordsRejected',rejected.length);
     for(const word of vote.words) {
       tx.set(db.collection('wordReviews').doc(env).collection('words').doc(word.key),{
         text:word.text,asks:FieldValue.increment(1),accepted:FieldValue.increment(accepted.includes(word) ? 1 : 0),
@@ -233,7 +286,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       try { me=validatePlayerDetails(data); }
       catch(e) { throw new HttpsError('invalid-argument',e.message); }
     }
-    return reply(await db.runTransaction(async tx=>{
+    return reply(await runTx(async tx=>{
       const old=await tx.get(ref);
       const now=Date.now();
       const closed=old.get('closedSessions') ?? [];
@@ -272,8 +325,11 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   case 'create': {
     const me=await details();
     await register(me);
-    const settings=tableSettings(data);
-    return reply(await db.runTransaction(tx=>openLobby(tx,me,settings,Date.now())));
+    const tuning=await tuningFor(db,env);
+    const stake=chooseStake(tuning,data.stake,balance);
+    if(stake==null)throw new HttpsError('failed-precondition',balance===undefined ? 'update' : 'diamonds',{stake:tuning.options[0],balance});
+    const settings=tableSettings({...data,stake},tuning);
+    return reply(await runTx(tx=>openLobby(tx,me,settings,Date.now())));
   }
 
   case 'join': {
@@ -281,7 +337,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     await register(me);
     if(!validCode(data.code))throw new HttpsError('invalid-argument','Invalid code');
     const invite=root.collection('invites').doc(data.code);
-    return reply(await db.runTransaction(async tx=>{
+    return reply(await runTx(async tx=>{
       const now=Date.now();
       const doc=await tx.get(invite);
       if(!doc.exists || doc.get('expiresMs')<=now)throw new HttpsError('not-found','expired');
@@ -291,20 +347,27 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       if(t.game.state!=='lobby')throw new HttpsError(t.game.state==='cancelled' ? 'not-found' : 'failed-precondition',
         t.game.state==='cancelled' ? 'expired' : 'started');
       if(t.game.seats.length>=tableRules.maxPlayers)throw new HttpsError('failed-precondition','full');
+      covers(t.game.settings.stake);
       const handId=newHandId();
       tx.update(ref,{seats:[...t.game.seats,seat(player,me,now)],...stamp()});
       tx.set(t.privateRef,kept({...t.secret,handIds:[...t.secret.handIds,handId]}));
+      count('joins');
       return {gameId:ref.id,handId,code:t.game.code};
     }));
   }
 
   case 'settings': {
     const ref=gameRef();
-    return reply(await db.runTransaction(async tx=>{
+    const tuning=await tuningFor(db,env);
+    return reply(await runTx(async tx=>{
       const t=await load(tx,ref);
       if(t.game.host!==player)throw new HttpsError('permission-denied','Only the host');
       if(t.game.state!=='lobby')refuse('not-playing');
-      const settings=tableSettings({...t.game.settings,...data});
+      // A price the settings no longer offer stays until the host picks another.
+      const offered=tuning.options.includes(t.game.settings.stake) ? tuning
+        : {...tuning,options:[...tuning.options,t.game.settings.stake ?? 0]};
+      const settings=tableSettings({...t.game.settings,...data},offered);
+      if(settings.stake!==(t.game.settings.stake ?? 0))covers(settings.stake);
       const changed=Object.keys(settings).some(key=>settings[key]!==t.game.settings[key]);
       tx.update(ref,{settings,seats:changed ? t.game.seats.map(s=>({...s,ready:false})) : t.game.seats,...stamp()});
       return {settings};
@@ -314,10 +377,11 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   case 'ready': {
     const ref=gameRef();
     if(typeof data.ready!=='boolean')throw new HttpsError('invalid-argument','Invalid readiness');
-    return reply(await db.runTransaction(async tx=>{
+    return reply(await runTx(async tx=>{
       const t=await load(tx,ref);
       const me=mine(t);
       if(t.game.state!=='lobby')refuse('not-playing');
+      if(data.ready)covers(t.game.settings.stake);
       const seats=t.game.seats.map((s,i)=>i===me ? {...s,ready:data.ready} : s);
       tx.update(ref,{seats,...stamp()});
       return {ready:data.ready};
@@ -326,7 +390,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
 
   case 'start': {
     const ref=gameRef();
-    return reply(await db.runTransaction(async tx=>{
+    const tuning=await tuningFor(db,env);
+    return reply(await runTx(async tx=>{
       const now=Date.now();
       const t=await load(tx,ref);
       const game=t.game;
@@ -334,10 +399,13 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       if(game.state!=='lobby')return {state:game.state};
       if(game.seats.length<tableRules.minPlayers)throw new HttpsError('failed-precondition','alone');
       if(game.seats.some(s=>!s.ready))throw new HttpsError('failed-precondition','not-ready');
+      covers(game.settings.stake);
       const {hands,pool}=deal(game.seats.length,game.settings.rackSize);
       const first=Math.floor(Math.random()*game.seats.length);
       game.state='playing';
       game.startedMs=now;
+      // The cut is fixed when the game starts, so a change in StageAdmin never touches a game being played.
+      game.houseCut=tuning.houseCut;
       game.colors=paint(game.settings.colors ?? 1);
       game.seats=game.seats.map((s,i)=>({...s,count:hands[i].length}));
       game.pool=pool.length;
@@ -347,6 +415,14 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       tx.set(t.privateRef,kept({...t.secret,pool}));
       writeHands(tx,t,hands);
       tx.delete(root.collection('invites').doc(game.code));
+      count('gamesStarted');
+      count(`players.${game.seats.length}`);
+      count(`rackSize.${statsKey(game.settings.rackSize)}`);
+      count(`turnSeconds.${statsKey(game.settings.turnSeconds)}`);
+      count(`colors.${statsKey(game.settings.colors ?? 1)}`);
+      for(const s of game.seats)count(`platforms.${statsKey(s.platform)}`);
+      count(`stakes.${statsKey(game.settings.stake ?? 0)}`);
+      if(game.settings.stake)count('diamondsStaked',game.settings.stake*game.seats.length);
       return {state:'playing'};
     }));
   }
@@ -354,7 +430,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   // The player on turn shows the others what they are building. Only the shape is checked; the rules wait for the play.
   case 'draft': {
     const ref=gameRef();
-    return reply(await db.runTransaction(async tx=>{
+    return reply(await runTx(async tx=>{
       const now=Date.now();
       const t=await load(tx,ref,{hands:true});
       onTurn(t.game,mine(t));
@@ -368,7 +444,15 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   case 'play': {
     const ref=gameRef();
     await isWord();
-    return reply(await db.runTransaction(async tx=>{
+    // A turn the rules refused is counted on its own, since its transaction writes nothing.
+    let refused=null;
+    try { return reply(await runPlay()); }
+    catch(e) {
+      if(refused)await statsRef().set({day:statsDay(),updatedMs:Date.now(),
+        refusals:{[statsKey(refused)]:FieldValue.increment(1)}},{merge:true}).catch(()=>{});
+      throw e;
+    }
+    async function runPlay() { return runTx(async tx=>{
       const now=Date.now();
       const t=await load(tx,ref,{hands:true});
       const game=t.game, me=mine(t);
@@ -377,19 +461,22 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       if(now>game.turn.endsAt+tableRules.graceMs)refuse('stale','Time is up');
       const result=judge(game,t.hands[me],me,data);
       // The first problem, with its details (the unknown words, the short word…), for the phone to show.
-      if(result.errors.length)throw new HttpsError('failed-precondition',result.errors[0].code,result.errors[0]);
+      if(result.errors.length) {
+        refused=result.errors[0].code;
+        throw new HttpsError('failed-precondition',result.errors[0].code,result.errors[0]);
+      }
       const hands=[...t.hands];
       const won=commitPlay(game,hands,t.secret,me,result,now);
       if(!won)advance(game,now);
       tx.set(ref,saved(game));
       writeHands(tx,t,hands,t.hands);
       return {state:game.state};
-    }));
+    }); }
   }
 
   case 'draw': {
     const ref=gameRef();
-    return reply(await db.runTransaction(async tx=>{
+    return reply(await runTx(async tx=>{
       const now=Date.now();
       const t=await load(tx,ref,{hands:true});
       const game=t.game, me=mine(t);
@@ -412,7 +499,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   case 'timeout': {
     const ref=gameRef();
     await isWord();
-    return reply(await db.runTransaction(async tx=>{
+    return reply(await runTx(async tx=>{
       const now=Date.now();
       const t=await load(tx,ref,{hands:true});
       const game=t.game, caller=mine(t);
@@ -439,6 +526,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
         game.pool=t.secret.pool.length;
         game.passStreak=0;
         log(game,{type:'penalty',seat:seatIndex,count},now);
+        tallied.add('penalties');
       } else {
         over=drawOrPass(game,hands,t.secret,seatIndex,now,'timeout-draw');
       }
@@ -448,6 +536,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
         if(missed>=tableRules.maxMissed) {
           game.seats[seatIndex]={...game.seats[seatIndex],left:true,dropped:true};
           log(game,{type:'dropped',seat:seatIndex},now);
+          tallied.add('dropped');
           over=lastOneStanding(game,hands,now);
         }
       }
@@ -463,7 +552,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   // the turn moves on if it was theirs. After the end: only marks them gone, for "עוד משחק".
   case 'leave': {
     const ref=gameRef();
-    return reply(await db.runTransaction(async tx=>{
+    return reply(await runTx(async tx=>{
       const now=Date.now();
       const t=await load(tx,ref,{hands:true});
       const game=t.game;
@@ -476,6 +565,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
         if(!seats.length) {
           tx.update(ref,{seats,state:'cancelled',finishedMs:now,...stamp()});
           tx.delete(invite);
+          count('lobbiesClosed');
         } else {
           tx.update(ref,{seats,host:game.host===player ? seats[0].id : game.host,...stamp()});
         }
@@ -486,6 +576,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
         if(game.seats[me].left)return {state:game.state};
         game.seats[me]={...game.seats[me],left:true};
         log(game,{type:'left',seat:me},now);
+        count('leftMidGame');
         const hands=[...t.hands];
         if(!lastOneStanding(game,hands,now) && game.turn.seat===me)advance(game,now);
         tx.set(ref,saved(game));
@@ -502,7 +593,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   // The app went to the background, or came back: the others see "לא באפליקציה". The clock does not stop.
   case 'away': case 'back': {
     const ref=gameRef();
-    return reply(await db.runTransaction(async tx=>{
+    return reply(await runTx(async tx=>{
       const t=await load(tx,ref);
       const me=mine(t);
       const away=data.action==='away';
@@ -518,7 +609,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   case 'ask': {
     const ref=gameRef();
     await isWord();
-    return reply(await db.runTransaction(async tx=>{
+    return reply(await runTx(async tx=>{
       const now=Date.now();
       const t=await load(tx,ref);
       const game=t.game, me=mine(t);
@@ -535,6 +626,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       // The clock cannot run out while the table votes: it is set to the vote's end plus what was left.
       game.turn={...game.turn,asked:true,endsAt:endsAt+left};
       log(game,{type:'ask',seat:me,words:words.map(w=>w.text)},now);
+      count('asks');
+      count('askedWords',words.length);
       tx.set(ref,saved(game));
       return {endsAt};
     }));
@@ -544,7 +637,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   // be changed until the time is up. When everyone has voted, the vote is settled at once.
   case 'vote': {
     const ref=gameRef();
-    return reply(await db.runTransaction(async tx=>{
+    return reply(await runTx(async tx=>{
       const now=Date.now();
       const t=await load(tx,ref);
       const game=t.game, me=mine(t);
@@ -564,7 +657,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   // Any phone, once the vote's time is up: counts it and gives the turn its clock back. Twice changes nothing.
   case 'settle': {
     const ref=gameRef();
-    return reply(await db.runTransaction(async tx=>{
+    return reply(await runTx(async tx=>{
       const now=Date.now();
       const t=await load(tx,ref);
       const game=t.game;
@@ -587,7 +680,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     const friend=data.friend;
     if(typeof friend!=='string' || !/^[0-9a-f]{64}$/.test(friend) || friend===player)
       throw new HttpsError('invalid-argument','Invalid friend');
-    return reply(await db.runTransaction(async tx=>{
+    return reply(await runTx(async tx=>{
       const now=Date.now();
       const t=await load(tx,ref);
       mine(t);
@@ -607,6 +700,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       tx.set(inboxRef,{invites:[...old,invite].slice(-inviteRules.kept),updatedMs:now,
         expireAt:Timestamp.fromMillis(invite.expiresMs+24*60*60_000)});
       tx.set(playerRef(player),{invitesSent:[...recent,now]},{merge:true});
+      count('friendInvites');
       return {sent:true};
     }));
   }
@@ -617,7 +711,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     const me=await details();
     await register(me);
     const ref=gameRef();
-    return reply(await db.runTransaction(async tx=>{
+    const tuning=await tuningFor(db,env);
+    return reply(await runTx(async tx=>{
       const now=Date.now();
       const t=await load(tx,ref);
       mine(t);
@@ -628,12 +723,17 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
         if(n.me>=0)return {gameId:nextRef.id,handId:n.secret.handIds[n.me],code:n.game.code};
         if(n.game.state!=='lobby')throw new HttpsError('failed-precondition','started');
         if(n.game.seats.length>=tableRules.maxPlayers)throw new HttpsError('failed-precondition','full');
+        covers(n.game.settings.stake);
         const handId=newHandId();
         tx.update(nextRef,{seats:[...n.game.seats,seat(player,me,now)],...stamp()});
         tx.set(n.privateRef,kept({...n.secret,handIds:[...n.secret.handIds,handId]}));
         return {gameId:nextRef.id,handId,code:n.game.code};
       }
-      const lobby=await openLobby(tx,me,t.game.settings,now,ref.id,(t.game.round ?? 1)+1);
+      // The same settings; the same price when this player can still pay it, otherwise the nearest they can.
+      const stake=chooseStake(tuning,t.game.settings.stake ?? 0,balance);
+      if(stake==null)throw new HttpsError('failed-precondition',balance===undefined ? 'update' : 'diamonds',
+        {stake:t.game.settings.stake,balance});
+      const lobby=await openLobby(tx,me,{...t.game.settings,stake},now,ref.id,(t.game.round ?? 1)+1);
       tx.update(ref,{next:lobby.gameId,...stamp()});
       return lobby;
     }));

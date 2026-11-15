@@ -29,12 +29,61 @@ export const tableRules={minPlayers:2,maxPlayers:4,minWordLength:3,openingPoints
   lobbyMs:30*60_000,startDelayMs:3_000,graceMs:2_500,maxMissed:3,maxWords:60,maxWordTiles:24,logSize:30,
   voteMs:15_000,maxAsked:3};
 
-export function tableSettings(input={}) {
+export function tableSettings(input={},tuning=tableTuning(null)) {
   const rackSize=tableRules.rackSizes.includes(input.rackSize) ? input.rackSize : tableRules.rackSize;
   const turnSeconds=tableRules.turnSecondsOptions.includes(input.turnSeconds) ? input.turnSeconds : tableRules.turnSeconds;
   const colors=tableRules.colorOptions.includes(input.colors) ? input.colors : tableRules.colors;
-  return {rackSize,turnSeconds,colors,minWordLength:tableRules.minWordLength,openingPoints:tableRules.openingPoints,
+  const stake=tuning.options.includes(input.stake) ? input.stake : tuning.options[0];
+  return {rackSize,turnSeconds,colors,stake,minWordLength:tableRules.minWordLength,openingPoints:tableRules.openingPoints,
     timeoutPenalty:tableRules.timeoutPenalty};
+}
+
+// The price of a seat (README.md, "Diamonds"): the game's settings (`gameTuning/{env}`, key `wordTable`, edited in
+// StageAdmin's Games tab) list the prices a host may pick and whether a free table is one of them; every player pays
+// the table's price when the game starts, and the winner takes the pot less the house's cut. Anything invalid falls
+// back to the defaults as a whole, as the apps do; with the diamonds switched off (`economy.enabled: false`) every
+// table is free.
+export const stakeRules={stakes:[20,50,100],freePlay:true,houseCut:10,maxStakes:5,maxStake:1000};
+
+export function tableTuning(payload) {
+  if(payload?.economy?.enabled===false)return {stakes:[],freePlay:true,houseCut:0,options:[0]};
+  const raw=payload?.wordTable;
+  let tuning={stakes:stakeRules.stakes,freePlay:stakeRules.freePlay,houseCut:stakeRules.houseCut};
+  if(raw && typeof raw==='object') {
+    const stakes=raw.stakes ?? tuning.stakes, freePlay=raw.freePlay ?? tuning.freePlay, houseCut=raw.houseCut ?? tuning.houseCut;
+    const valid=Array.isArray(stakes) && stakes.length<=stakeRules.maxStakes
+      && stakes.every((n,i)=>Number.isInteger(n) && n>=1 && n<=stakeRules.maxStake && (i===0 || n>stakes[i-1]))
+      && typeof freePlay==='boolean' && Number.isInteger(houseCut) && houseCut>=0 && houseCut<=100
+      && (freePlay || stakes.length>0);
+    if(valid)tuning={stakes,freePlay,houseCut};
+  }
+  return {...tuning,options:[...(tuning.freePlay ? [0] : []),...tuning.stakes]};
+}
+
+// The price a host gets: the one they asked for if their diamonds cover it, otherwise the dearest they can pay up to
+// it, otherwise the cheapest they can pay at all; null when they cannot pay any (no free tables, too few diamonds).
+// An app from before prices sends no balance and can only open a free table.
+export function chooseStake(tuning,wanted,balance) {
+  const can=tuning.options.filter(n=>n===0 || (Number.isFinite(balance) && n<=balance));
+  if(!can.length)return null;
+  if(can.includes(wanted))return wanted;
+  const below=can.filter(n=>n<=wanted);
+  return below.length ? below[below.length-1] : can[0];
+}
+
+// What each seat gets back when the game ends. Every seat paid the price at the start (a leaver too), so the pot is
+// price × seats; the winner takes it less the house's cut (rounded in the house's favour). A game with no winner gives
+// each seat still at the table its own price back, with no cut.
+export function payouts(seats,stake,houseCut,winner) {
+  const none=seats.map(()=>0);
+  if(!stake)return {pot:0,cut:0,payouts:none};
+  const pot=stake*seats.length;
+  if(winner==null) {
+    const back=seats.map(s=>s.left ? 0 : stake);
+    return {pot,cut:0,payouts:back};
+  }
+  const cut=Math.ceil(pot*houseCut/100);
+  return {pot,cut,payouts:none.map((n,i)=>i===winner ? pot-cut : 0)};
 }
 
 export function shuffle(list,random=Math.random) {

@@ -87,6 +87,26 @@ followed by their device key: only their own phone can work out that address.
 - `inviteFriend {gameId, friend}` adds an invitation (the code, who sent it, when it ends) to the friend's inbox, at most 10 a minute per sender.
 - `presence {mode, session}` publishes an app-wide foreground lease: `open` registers the player, `pulse` renews it, and `close` clears it on background. A lost close expires after 45 seconds. `friendPresence {friends}` returns only the IDs currently online; the apps check while the friend list or lobby is visible.
 
+## Diamonds
+
+A table can have a price. The game's settings (`gameTuning/{env}`, key `wordTable`: `stakes`, `freePlay`, `houseCut`)
+list the prices a host may pick and whether a free table is one of them. Every player pays when the game starts, and
+the winner takes the pot (price × seats) less the house's cut, rounded in the house's favour. A game with no winner
+gives each seat still at the table its price back. The diamonds themselves live on the phones, so every call carries
+the player's `balance`. A priced table refuses a join, a ready, the host's change of price, a start and "again" with
+`diamonds` when the balance is short, and with `update` when an older app sends none. The result carries `pot` and
+`payouts` (per seat). `tableTuning`, `chooseStake` and `payouts` in `src/table.js`.
+
+## Statistics
+
+Aggregated only, never per player. The function adds counters to one document a
+day, `tableStats/{env}/days/{yyyy-mm-dd}` in Israel time, inside the same
+transaction as the move it counts (`functions/src/stats.js`): tables opened and
+joined, games started and finished and how they ended, turns by kind, letters
+played, refused plays by reason, votes and their results, and the settings and
+platforms of the games started, the price of a seat, and the diamonds staked, paid out and kept as the house's cut. A retried transaction starts a new tally, so
+nothing counts twice. No client can read these documents.
+
 ## How long things are kept
 
 Every write moves `expireAt` 30 days ahead on a table, its hands, its private state

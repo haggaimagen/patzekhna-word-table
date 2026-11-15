@@ -289,3 +289,72 @@ test('friends: presence follows the foreground session and expires without a clo
   assert.deepEqual(await online(),[],'a crashed phone goes offline when its lease ends');
   await fails(table(a,'friendPresence',{friends:['bad']}),'invalid-argument');
 });
+
+test('statistics: one document a day, aggregated, with no player in it',async()=>{
+  const {statsDay}=await import('../src/stats.js');
+  const day=db.doc(`tableStats/${env}/days/${statsDay()}`);
+  const before=(await day.get()).data() ?? {};
+  const a=player(key('c'),'שחף'), b=player(key('d'),'עגור');
+  const made=await table(a,'create',{rackSize:7,colors:2});
+  const joined=await table(b,'join',{code:made.code});
+  await table(a,'ready',{gameId:made.gameId,ready:true}).catch(()=>{});
+  await table(b,'ready',{gameId:made.gameId,ready:true}).catch(()=>{});
+  await table(a,'start',{gameId:made.gameId});
+  let g=await game(made.gameId);
+  await db.doc(`tables/${env}/games/${made.gameId}`).update({'turn.startedMs':0,colors:{}});
+  const on=g.seats[g.turn.seat].id===id(a.playerKey) ? {who:a,handId:made.handId} : {who:b,handId:joined.handId};
+  // A refused turn is counted by its reason.
+  await fails(table(on.who,'play',{gameId:made.gameId,turn:1,board:[]}),'failed-precondition','nothing');
+  const used=new Set();
+  const shalom=spell('שלומ',used), sefer=spell('ספר',used);
+  await giveHand(made.gameId,on.handId,[...shalom,...sefer]);
+  await table(on.who,'play',{gameId:made.gameId,turn:1,board:[{id:'w1',tiles:shalom},{id:'w2',tiles:sefer}]});
+  const after=(await day.get()).data();
+  const grew=k=>(after[k] ?? 0)-(before[k] ?? 0);
+  const grewIn=(m,k)=>(after[m]?.[k] ?? 0)-(before[m]?.[k] ?? 0);
+  assert.equal(grew('tablesCreated'),1);
+  assert.equal(grew('joins'),1);
+  assert.equal(grew('gamesStarted'),1);
+  assert.equal(grew('plays'),1);
+  assert.equal(grew('tilesPlayed'),7);
+  assert.equal(grew('wordsMade'),2);
+  assert.equal(grew('openings'),1);
+  assert.equal(grew('gamesFinished'),1);
+  assert.equal(grewIn('ends','empty'),1);
+  assert.equal(grewIn('players','2'),1);
+  assert.equal(grewIn('rackSize','7'),1);
+  assert.equal(grewIn('colors','2'),1);
+  assert.equal(grewIn('platforms','ios'),2);
+  assert.equal(grewIn('refusals','nothing'),1);
+  assert.equal(after.day,statsDay());
+  const text=JSON.stringify(after);
+  assert.equal(text.includes(id(a.playerKey)) || text.includes('שחף'),false,'no player in the statistics');
+});
+
+test('prices: only players who can pay sit down, and the winner takes the pot less the cut',async()=>{
+  const a={...player(key('e'),'נשר'),balance:60}, b=player(key('f'),'ינשוף');
+  const made=await table(a,'create',{stake:100});
+  let g=await game(made.gameId);
+  assert.equal(g.settings.stake,50,'the dearest price the host can pay');
+  await fails(table(b,'join',{code:made.code}),'failed-precondition','update');
+  await fails(table({...b,balance:10},'join',{code:made.code}),'failed-precondition','diamonds');
+  await table({...b,balance:500},'join',{code:made.code});
+  await fails(table({...b,balance:30},'ready',{gameId:made.gameId,ready:true}),'failed-precondition','diamonds');
+  await table({...b,balance:500},'ready',{gameId:made.gameId,ready:true});
+  // A price the host cannot pay is refused; a cheaper one clears everyone's readiness.
+  await fails(table(a,'settings',{gameId:made.gameId,stake:100}),'failed-precondition','diamonds');
+  await table(a,'settings',{gameId:made.gameId,stake:20});
+  g=await game(made.gameId);
+  assert.equal(g.settings.stake,20);
+  assert.equal(g.seats[1].ready,false);
+  await table({...b,balance:500},'ready',{gameId:made.gameId,ready:true});
+  await table(a,'ready',{gameId:made.gameId,ready:true});
+  await table(a,'start',{gameId:made.gameId});
+  g=await game(made.gameId);
+  assert.equal(g.houseCut,10);
+  await table(b,'leave',{gameId:made.gameId});
+  g=await game(made.gameId);
+  assert.equal(g.state,'finished');
+  assert.equal(g.result.pot,40);
+  assert.deepEqual(g.result.payouts,[36,0],'40 less 10%');
+});

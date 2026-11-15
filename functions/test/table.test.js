@@ -2,7 +2,7 @@
 // cases against Models/WordTable.swift.
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {TILES,ALPHABET,tileOf,tableRules,tableSettings,deal,paint,colorOf,wordText,wordKey,checkPlay,handValue,nextSeat,
+import {TILES,ALPHABET,tileOf,tableRules,tableSettings,tableTuning,chooseStake,payouts,deal,paint,colorOf,wordText,wordKey,checkPlay,handValue,nextSeat,
   finalScores,readBoard,readAsked,tally} from '../src/table.js';
 import {isWord,dictionarySize,dictionaryVersion,withLists} from '../src/dictionary.js';
 
@@ -215,3 +215,55 @@ test('review decisions on top of the list: deny wins, allow adds', ()=>{
   assert.equal(withLists({allow:['בית'],deny:['בית']})('בית'),false);
   assert.equal(withLists(null)('בית'),true);
 });
+
+import {statsDay,newTally,statsKey} from '../src/stats.js';
+
+test('statistics: an Israel day, and counts gathered into one nested update', ()=>{
+  // 2026-11-13 22:30 UTC is already the 14th in Israel (UTC+2).
+  assert.equal(statsDay(Date.UTC(2026,10,13,22,30)),'2026-11-14');
+  assert.equal(statsDay(Date.UTC(2026,10,13,21,30)),'2026-11-13');
+  const t=newTally();
+  assert.equal(t.size,0);
+  t.add('plays'); t.add('plays'); t.add('tilesPlayed',5); t.add('players.3'); t.add('ends.empty'); t.add('ends.left',0);
+  assert.deepEqual(t.update(n=>n),{plays:2,tilesPlayed:5,players:{'3':1},ends:{empty:1}});
+  assert.equal(statsKey('android'),'android');
+  assert.equal(statsKey('a.b/c'),'abc');
+  assert.equal(statsKey(''),'other');
+});
+
+test('prices: the settings offer free and the listed prices; anything invalid is the defaults', ()=>{
+  const d=tableTuning(null);
+  assert.deepEqual(d.options,[0,20,50,100]);
+  assert.equal(d.houseCut,10);
+  assert.deepEqual(tableTuning({wordTable:{stakes:[10,30],freePlay:false,houseCut:0}}).options,[10,30]);
+  assert.deepEqual(tableTuning({wordTable:{stakes:[50,20]}}).options,d.options,'not ascending');
+  assert.deepEqual(tableTuning({wordTable:{stakes:[],freePlay:false}}).options,d.options,'nothing to play for');
+  assert.deepEqual(tableTuning({wordTable:{houseCut:101}}).options,d.options);
+  assert.deepEqual(tableTuning({wordTable:{stakes:[]}}).options,[0],'free only');
+  assert.deepEqual(tableTuning({economy:{enabled:false},wordTable:{freePlay:false}}).options,[0],'diamonds off: all free');
+  assert.equal(tableSettings({stake:50}).stake,50);
+  assert.equal(tableSettings({stake:40}).stake,0,'not offered');
+  assert.equal(tableSettings({},tableTuning({wordTable:{freePlay:false}})).stake,20,'the cheapest when free is off');
+});
+
+test('prices: a host gets the price they can pay', ()=>{
+  const d=tableTuning(null);
+  assert.equal(chooseStake(d,50,60),50);
+  assert.equal(chooseStake(d,100,60),50,'the dearest they can pay up to it');
+  assert.equal(chooseStake(d,100,10),0);
+  assert.equal(chooseStake(d,50,undefined),0,'an old app: free only');
+  const paid=tableTuning({wordTable:{freePlay:false}});
+  assert.equal(chooseStake(paid,0,30),20,'free is not offered');
+  assert.equal(chooseStake(paid,100,10),null,'cannot pay any');
+  assert.equal(chooseStake(paid,20,undefined),null);
+});
+
+test('prices: the winner takes the pot less the cut; no winner gives each seat back its price', ()=>{
+  const seats=[{},{},{left:true},{}];
+  assert.deepEqual(payouts(seats,50,10,1),{pot:200,cut:20,payouts:[0,180,0,0]});
+  assert.deepEqual(payouts(seats.slice(0,2),25,10,0),{pot:50,cut:5,payouts:[45,0]});
+  assert.deepEqual(payouts(seats.slice(0,3),20,15,0),{pot:60,cut:9,payouts:[51,0,0]},'rounded for the house');
+  assert.deepEqual(payouts(seats,50,10,null),{pot:200,cut:0,payouts:[50,50,0,50]});
+  assert.deepEqual(payouts(seats,0,10,1).payouts,[0,0,0,0]);
+});
+
