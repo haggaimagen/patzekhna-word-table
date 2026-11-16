@@ -450,7 +450,7 @@ test('bots: the host seats them, they are always ready, play on the server, and 
   assert.equal((after.platforms?.bot ?? 0)-(before.platforms?.bot ?? 0),0,'bots are not a platform');
 });
 
-test('bots: at a priced table they neither pay nor collect, and a bot that wins gives the pot to the best human',async()=>{
+test('bots: at a priced table they neither pay nor collect, and a bot that wins leaves the pot to the house',async()=>{
   const a={...player(key('3'),'אייל'),balance:100}, b={...player(key('4'),'יעל'),balance:100};
   const made=await table(a,'create',{stake:50});
   const gameId=made.gameId;
@@ -467,7 +467,7 @@ test('bots: at a priced table they neither pay nor collect, and a bot that wins 
   const botHand=(()=>{ const u=new Set(); return [...spell('שלומ',u),...spell('ספר',u)]; })();
   await giveHand(gameId,await handIdOf(gameId,2),botHand);
   g=await game(gameId);
-  // The humans' hands: b's is the cheaper, so b takes the pot.
+  // The humans' hands: b's is the cheaper, yet nobody takes the pot.
   const used=new Set(botHand);
   const cheap=TILES.filter(t=>!used.has(t.id) && !t.joker && t.value===1).slice(0,2).map(t=>t.id);
   await giveHand(gameId,await handIdOf(gameId,1),cheap);
@@ -478,8 +478,8 @@ test('bots: at a priced table they neither pay nor collect, and a bot that wins 
   assert.equal(g.state,'finished',JSON.stringify({log:g.log,seats:g.seats,turn:g.turn,draft:g.draft}));
   assert.equal(g.result.winner,2);
   assert.equal(g.result.pot,100,'two humans × 50');
-  assert.equal(g.result.taker,1);
-  assert.deepEqual(g.result.payouts,[0,90,0]);
+  assert.equal(g.result.taker,null);
+  assert.deepEqual(g.result.payouts,[0,0,0],'the house keeps it');
 });
 
 // The host removes a player from the lobby (README.md, "Removing a player").

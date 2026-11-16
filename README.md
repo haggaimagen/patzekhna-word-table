@@ -149,8 +149,8 @@ Each change of bots clears the players' readiness, as a change of settings does.
   the length is lifted for that opening only.
 - **Diamonds:** bots never pay and never collect. The pot is the price × the human seats. A table of the host and bots
   only costs the host a flat price instead (`gameTuning/{env}` key `wordTable`, `botPrice`, 0–1000, 10 by default),
-  paid at the start, with no pot. When a bot finishes first at a priced table, the human with the lowest hand still
-  at the table takes the pot less the cut (`stakeRules.botWin`; the result's `taker` says who).
+  paid at the start, with no pot. When a bot finishes first at a priced table, the house keeps the whole pot
+  (`stakeRules.botWin`; counted in `diamondsCut`).
 - **Votes:** bots do not vote, and against bots only there is nobody to ask (`no-voters`).
 - **The end:** when no human is left in a game, it ends.
 - **Statistics:** `botsAdded`, `botGames`, `botOnlyGames`, `botLevels.{1–5}`, `botPlays`, `botTiles`, `botDraws`,

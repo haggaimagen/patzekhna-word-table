@@ -44,9 +44,10 @@ export function tableSettings(input={},tuning=tableTuning(null)) {
 // back to the defaults as a whole, as the apps do; with the diamonds switched off (`economy.enabled: false`) every
 // table is free.
 export const stakeRules={stakes:[20,50,100],freePlay:true,houseCut:10,maxStakes:5,maxStake:1000,botPrice:10,
-  // A table with bots where a bot finishes first: the pot goes to the best human (the lowest hand among those still
-  // at the table), less the cut, as if that player had won. 'refund' would give each human still in their price back.
-  botWin:'bestHuman'};
+  // A priced table with bots where a bot finishes first: the whole pot goes to the house (the user, 2026-11-16).
+  // 'bestHuman' would give it, less the cut, to the human with the lowest hand still at the table; 'refund' would give
+  // each human still in their price back.
+  botWin:'house'};
 
 export function tableTuning(payload) {
   if(payload?.economy?.enabled===false)return {stakes:[],freePlay:true,houseCut:0,botPrice:0,options:[0]};
@@ -80,7 +81,7 @@ export function chooseStake(tuning,wanted,balance) {
 
 // What each seat gets back when the game ends. Bots never pay and never collect (README.md, "Bots"), so the pot is
 // the price × the human seats, every one of which paid at the start (a leaver too). The winner takes it less the house's
-// cut (rounded in the house's favour). When a bot wins, the best human takes it instead (`stakeRules.botWin`). A game
+// cut (rounded in the house's favour). When a bot wins, the house keeps the whole pot (`stakeRules.botWin`). A game
 // with no winner gives each human still at the table their own price back, with no cut. A game against bots only
 // (`botTable`) has no pot: its price was the cost of the game.
 export function payouts(seats,stake,houseCut,winner,{values=[],botTable=false,botWin=stakeRules.botWin}={}) {
@@ -91,6 +92,7 @@ export function payouts(seats,stake,houseCut,winner,{values=[],botTable=false,bo
   let taker=winner;
   if(taker!=null && seats[taker]?.bot) {
     taker=null;
+    if(botWin==='house')return {pot,cut:pot,taker:null,payouts:none};
     if(botWin==='bestHuman')for(const i of humans)
       if(!seats[i].left && (taker==null || (values[i] ?? 0)<(values[taker] ?? 0)))taker=i;
   }

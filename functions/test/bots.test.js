@@ -264,13 +264,15 @@ test('bots: names, levels and seats', ()=>{
   assert.equal(isBotTable([{},{}]),false);
 });
 
-test('bots: never pay, never collect; a bot-only table has no pot; a bot that wins gives the pot to the best human', ()=>{
+test('bots: never pay, never collect; a bot-only table has no pot; a bot that wins gives the pot to the house', ()=>{
   const seats=[{},{bot:true},{},{bot:true}];
   assert.deepEqual(payouts(seats,50,10,0),{pot:100,cut:10,taker:0,payouts:[90,0,0,0]},'the pot is the humans\' prices');
-  assert.deepEqual(payouts(seats,50,10,1,{values:[12,0,7,3]}),{pot:100,cut:10,taker:2,payouts:[0,0,90,0]},
-    'a bot won: the human with the lowest hand takes it');
+  assert.deepEqual(payouts(seats,50,10,1,{values:[12,0,7,3]}),{pot:100,cut:100,taker:null,payouts:[0,0,0,0]},
+    'a bot won: the house keeps the pot');
+  assert.deepEqual(payouts(seats,50,10,1,{values:[12,0,7,3],botWin:'bestHuman'}),{pot:100,cut:10,taker:2,payouts:[0,0,90,0]},
+    'the other rule: the human with the lowest hand');
   assert.deepEqual(payouts(seats,50,10,1,{values:[12,0,7,3],botWin:'refund'}).payouts,[50,0,50,0]);
-  assert.deepEqual(payouts([{},{bot:true},{left:true},{bot:true}],50,10,3,{values:[12,0,1,3]}).taker,0,
+  assert.deepEqual(payouts([{},{bot:true},{left:true},{bot:true}],50,10,3,{values:[12,0,1,3],botWin:'bestHuman'}).taker,0,
     'a human who left cannot take it');
   assert.deepEqual(payouts(seats,50,10,null).payouts,[50,0,50,0],'no winner: humans get their price back');
   assert.deepEqual(payouts([{},{bot:true}],50,10,0,{botTable:true}),{pot:0,cut:0,taker:null,payouts:[0,0]});
