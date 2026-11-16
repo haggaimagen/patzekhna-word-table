@@ -21,6 +21,7 @@ after(async()=>{await deleteApp(app);await deleteAdminApp(admin)});
 
 const env='development';
 const key=c=>c.repeat(64);
+const lobbyKey=name=>createHash('sha256').update(`public-lobby:${name}`).digest('hex');
 const id=k=>createHash('sha256').update(k).digest('hex');
 const player=(k,nickname)=>({playerKey:k,environment:env,nickname,platform:'ios',appVersion:'1.2.5'});
 const table=async(who,action,extra={})=>(await call({...who,action,...extra})).data;
@@ -39,6 +40,110 @@ const spell=(word,used)=>[...word].map(l=>{
   const t=TILES.find(t=>t.letter===l && !used.has(t.id));
   used.add(t.id);
   return t.id;
+});
+
+test('public discovery, visitor leases and room visibility follow the waiting room',async()=>{
+  const host=player(lobbyKey('host'),'מארח'), guest=player(lobbyKey('guest'),'אורח'), watcher=player(lobbyKey('watcher'),'צופה');
+  const hostSession='a'.repeat(32), guestSession='b'.repeat(32);
+  await table(host,'presence',{mode:'open',session:hostSession});
+  await table(guest,'lobbyPresence',{mode:'open',session:guestSession});
+  const hidden=await table(host,'create',{});
+  assert.equal((await game(hidden.gameId)).visibility,'private');
+  assert.equal((await table(watcher,'browseLobby')).rooms.some(r=>r.gameId===hidden.gameId),false);
+  const made=await table(host,'create',{visibility:'public',maxPlayers:2});
+  let browse=await table(watcher,'browseLobby');
+  const room=browse.rooms.find(r=>r.gameId===made.gameId);
+  assert.deepEqual({host:room.host,seats:room.seats,maxPlayers:room.maxPlayers,bots:room.bots},
+    {host:'מארח',seats:1,maxPlayers:2,bots:0});
+  assert.equal(JSON.stringify(room).includes(made.code),false,'browse reveals no invite code');
+  assert.ok(browse.visitors.includes('אורח'));
+  assert.deepEqual(browse.players.find(p=>p.nickname==='מארח'),
+    {nickname:'מארח',busy:true,roomId:made.gameId},'a public waiting host appears busy to other browsers');
+  await table(guest,'lobbyPresence',{mode:'close',session:guestSession});
+  await table(guest,'lobbyPresence',{mode:'pulse',session:guestSession});
+  assert.equal((await table(watcher,'browseLobby')).visitors.includes('אורח'),false);
+
+  await table(host,'presence',{mode:'close',session:hostSession});
+  assert.equal((await table(watcher,'browseLobby')).rooms.some(r=>r.gameId===made.gameId),false,
+    'an offline host is not advertised');
+  await table(host,'presence',{mode:'open',session:'c'.repeat(32)});
+  await fails(table(host,'settings',{gameId:made.gameId,maxPlayers:5}),'invalid-argument');
+  await table(guest,'joinPublic',{gameId:made.gameId});
+  assert.equal((await table(watcher,'browseLobby')).rooms.some(r=>r.gameId===made.gameId),false,
+    'older clients still see only joinable rooms');
+  assert.equal((await table(watcher,'browseLobby')).allRooms.find(r=>r.gameId===made.gameId).status,'full');
+  await fails(table(watcher,'join',{code:made.code}),'failed-precondition','full');
+  await fails(table(host,'settings',{gameId:made.gameId,maxPlayers:1}),'invalid-argument');
+  await table(host,'settings',{gameId:made.gameId,maxPlayers:3});
+  await table(watcher,'join',{code:made.code});
+  await fails(table(host,'settings',{gameId:made.gameId,maxPlayers:2}),'failed-precondition','occupied');
+  await table(watcher,'leave',{gameId:made.gameId});
+  await table(host,'settings',{gameId:made.gameId,maxPlayers:2});
+  await table(guest,'leave',{gameId:made.gameId});
+  assert.equal((await table(watcher,'browseLobby')).rooms.some(r=>r.gameId===made.gameId),true,
+    'a freed seat reopens the room');
+  await table(host,'settings',{gameId:made.gameId,visibility:'private'});
+  assert.equal((await table(watcher,'browseLobby')).rooms.some(r=>r.gameId===made.gameId),false);
+  await fails(table(watcher,'joinPublic',{gameId:made.gameId}),'failed-precondition','private');
+  assert.equal((await table(watcher,'join',{code:made.code})).gameId,made.gameId,
+    'private code joins still work');
+  await ready(host,made.gameId);
+  await ready(watcher,made.gameId);
+  await table(host,'settings',{gameId:made.gameId,visibility:'public'});
+  assert.deepEqual((await game(made.gameId)).seats.map(s=>s.ready),[true,true],
+    'changing visibility does not clear readiness');
+  await table(host,'start',{gameId:made.gameId});
+  assert.equal((await game(made.gameId)).discoverable,true);
+  const playing=await table(guest,'browseLobby');
+  assert.equal(playing.allRooms.find(r=>r.gameId===made.gameId).status,'playing');
+  assert.equal(playing.rooms.some(r=>r.gameId===made.gameId),false);
+  assert.deepEqual(playing.players.filter(p=>p.busy).map(p=>p.nickname).sort(),['מארח','צופה'].sort());
+  await fails(table(guest,'joinPublic',{gameId:made.gameId}),'failed-precondition','started');
+  await table(watcher,'leave',{gameId:made.gameId});
+  assert.equal((await game(made.gameId)).discoverable,false);
+  assert.equal((await table(guest,'browseLobby')).allRooms.some(r=>r.gameId===made.gameId),false);
+  const again=await table(host,'again',{gameId:made.gameId});
+  assert.equal((await game(again.gameId)).visibility,'private');
+  assert.equal((await game(again.gameId)).settings.maxPlayers,2);
+});
+
+test('available rooms and players sort before full and playing ones',async()=>{
+  const openHost=player(lobbyKey('sort-open'),'פתוח');
+  const fullHost=player(lobbyKey('sort-full'),'מלא');
+  const playHost=player(lobbyKey('sort-play'),'משחק');
+  const fullGuest=player(lobbyKey('sort-full-guest'),'יושב');
+  const playGuest=player(lobbyKey('sort-play-guest'),'יריב');
+  const browser=player(lobbyKey('sort-browser'),'פנוי');
+  const viewer=player(lobbyKey('sort-viewer'),'צופה נוסף');
+  for(const [who,session] of [[openHost,'e'],[fullHost,'f'],[playHost,'0']])
+    await table(who,'presence',{mode:'open',session:session.repeat(32)});
+  await table(browser,'lobbyPresence',{mode:'open',session:'1'.repeat(32)});
+  const open=await table(openHost,'create',{visibility:'public',maxPlayers:2});
+  const full=await table(fullHost,'create',{visibility:'public',maxPlayers:2});
+  await table(fullGuest,'joinPublic',{gameId:full.gameId});
+  const playing=await table(playHost,'create',{visibility:'public',maxPlayers:2});
+  await table(playGuest,'joinPublic',{gameId:playing.gameId});
+  await ready(playHost,playing.gameId);
+  await ready(playGuest,playing.gameId);
+  await table(playHost,'start',{gameId:playing.gameId});
+  const listing=await table(viewer,'browseLobby');
+  const cards=listing.allRooms.filter(r=>[open.gameId,full.gameId,playing.gameId].includes(r.gameId));
+  assert.deepEqual(cards.map(r=>r.status),['available','full','playing']);
+  assert.deepEqual(listing.rooms.filter(r=>[open.gameId,full.gameId,playing.gameId].includes(r.gameId)).map(r=>r.gameId),
+    [open.gameId]);
+  assert.equal(listing.players[0].nickname,'פנוי');
+  assert.equal(listing.players[0].busy,false);
+  assert.deepEqual(listing.players.filter(p=>p.busy).map(p=>p.nickname).sort(),
+    ['פתוח','מלא','יושב','משחק','יריב'].sort());
+});
+
+test('two public joins racing for the last seat cannot overfill it',async()=>{
+  const host=player(lobbyKey('race-host'),'מארחת'), first=player(lobbyKey('race-first'),'ראשון'), second=player(lobbyKey('race-second'),'שני');
+  await table(host,'presence',{mode:'open',session:'d'.repeat(32)});
+  const made=await table(host,'create',{visibility:'public',maxPlayers:2});
+  const joins=await Promise.allSettled([first,second].map(who=>table(who,'joinPublic',{gameId:made.gameId})));
+  assert.equal(joins.filter(result=>result.status==='fulfilled').length,1);
+  assert.equal((await game(made.gameId)).seats.length,2);
 });
 
 // Puts chosen tiles in a seat's hand, swapping with the pool so the box stays whole.

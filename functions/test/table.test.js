@@ -3,7 +3,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {TILES,ALPHABET,tileOf,tableRules,tableSettings,tableTuning,chooseStake,payouts,deal,paint,colorOf,wordText,wordKey,checkPlay,handValue,nextSeat,
-  finalScores,readBoard,readAsked,tally,kickSeat} from '../src/table.js';
+  finalScores,readBoard,readAsked,tally,kickSeat,maxSeats,discoverable,joinable} from '../src/table.js';
 import {isWord,dictionarySize,dictionaryVersion,withLists} from '../src/dictionary.js';
 
 // Tile ids by letter, in box order: ids('ש',2) → the first two ש tiles.
@@ -32,6 +32,23 @@ test('settings take only the offered choices', ()=>{
   assert.equal(tableSettings({rackSize:9}).rackSize,14);
   assert.equal(tableSettings({rackSize:7}).rackSize,14,'7 and 10 are no longer offered');
   assert.equal(tableSettings({turnSeconds:5}).turnSeconds,60);
+  assert.equal(tableSettings({}).maxPlayers,4);
+  assert.equal(tableSettings({maxPlayers:2}).maxPlayers,2);
+  assert.equal(tableSettings({maxPlayers:5}).maxPlayers,4);
+});
+
+test('a public table stays listed when full or playing, but only an open room can be joined',()=>{
+  const game={state:'lobby',visibility:'public',settings:{maxPlayers:2},seats:[{}]};
+  assert.equal(maxSeats(game),2);
+  assert.equal(discoverable(game),true);
+  assert.equal(joinable(game),true);
+  assert.equal(discoverable({...game,seats:[{},{}]}),true);
+  assert.equal(joinable({...game,seats:[{},{}]}),false);
+  assert.equal(discoverable({...game,visibility:'private'}),false);
+  assert.equal(discoverable({...game,state:'playing'}),true);
+  assert.equal(joinable({...game,state:'playing'}),false);
+  assert.equal(discoverable({...game,state:'finished'}),false);
+  assert.equal(maxSeats({...game,settings:{}}),4,'older tables keep their four-seat default');
 });
 
 test('deal gives each seat its rack and keeps the rest in the pool', ()=>{
@@ -139,9 +156,9 @@ test('scores: losers pay their hand (leavers too), the winner collects; blocked 
 });
 
 test('colours: chosen in the lobby, about half the letters painted, never a joker', ()=>{
-  assert.equal(tableSettings({}).colors,1);
+  assert.equal(tableSettings({}).colors,2,'a new table plays two colours unless the host picks otherwise');
   assert.equal(tableSettings({colors:3}).colors,3);
-  assert.equal(tableSettings({colors:5}).colors,1);
+  assert.equal(tableSettings({colors:5}).colors,2);
   assert.deepEqual(paint(1),{});
   let seed=1;
   const random=()=>((seed=(seed*16807)%2147483647)-1)/2147483646;

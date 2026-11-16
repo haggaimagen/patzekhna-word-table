@@ -12,7 +12,7 @@ import {getFirestore,FieldValue,Timestamp} from 'firebase-admin/firestore';
 import {onCall,HttpsError} from 'firebase-functions/v2/https';
 import {validatePlayerDetails,validCode,validMatchID,makeCode} from './players.js';
 import {boardNickname} from './nicknames.js';
-import {tableRules,tableSettings,tableTuning,chooseStake,payouts,deal,paint,checkPlay,handValue,nextSeat,finalScores,readAsked,tally,kickSeat}
+import {tableRules,tableSettings,tableTuning,chooseStake,payouts,deal,paint,checkPlay,handValue,nextSeat,finalScores,readAsked,tally,kickSeat,maxSeats,discoverable,joinable}
   from './table.js';
 import {dictionaryVersion,withLists,listsFor} from './dictionary.js';
 import {statsDay,newTally,statsKey} from './stats.js';
@@ -20,7 +20,8 @@ import {botRules,validLevel,thinkMs,findMove,isBotTable,botSeat,botReveal} from 
 
 const actions=['create','join','settings','ready','start','draft','play','draw','timeout','leave','away','back','again',
   'presence','friendPresence',
-  'ask','vote','settle','inviteFriend','addBot','removeBot','botLevel','kick'];
+  'ask','vote','settle','inviteFriend','addBot','removeBot','botLevel','kick',
+  'browseLobby','lobbyPresence','joinPublic'];
 // "The table has moved on", not a bad request: the app drops the move and follows the table.
 const stale=['stale','not-your-turn','not-playing','voting','starting'];
 
@@ -49,6 +50,8 @@ export const inboxOf=playerKey=>createHash('sha256').update(`table-inbox:${playe
 const playerKeepMs=365*24*60*60_000;
 const inviteRules={perMinute:10,kept:10};
 const presenceLeaseMs=45_000;
+const lobbyRoomsLimit=40;
+const lobbyVisitorsLimit=40;
 
 // The game's settings for prices (table.js, `tableTuning`): read once a minute per instance, every time in the emulator.
 const tuningCache=new Map();
@@ -142,7 +145,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
   const priceOf=(game,tuning)=>isBotTable(game.seats) ? tuning.botPrice : (game.settings.stake ?? 0);
 
   // A new lobby with the caller as host, and a free code for it.
-  async function openLobby(tx,me,settings,now,previous=null,round=1,bots=[]) {
+  async function openLobby(tx,me,settings,now,previous=null,round=1,bots=[],visibility='private') {
     let code, invite;
     for(let attempt=0;attempt<6 && !invite;attempt++) {
       code=makeCode();
@@ -157,7 +160,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
     // "עוד משחק" brings the bots along, at their levels.
     const seats=[seat(player,me,now)];
     for(const b of bots)seats.push(botSeat(seats,b.level,now,newBotId()));
-    tx.set(ref,{state:'lobby',code,createdMs:now,expiresMs,host:player,settings,seats,board:[],
+    const room={state:'lobby',visibility,code,createdMs:now,expiresMs,host:player,settings,seats};
+    tx.set(ref,{...room,discoverable:discoverable(room),board:[],
       jokers:{},colors:{},accepted:[],vote:null,dictionary:dictionaryVersion,pool:0,turn:null,draft:null,log:[],passStreak:0,result:null,next:null,previous,round,startedMs:null,
       finishedMs:null,...stamp()});
     tx.set(ref.collection('private').doc('state'),kept({pool:[],handIds:[handId,...bots.map(()=>newHandId())]}));
@@ -185,6 +189,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       {values,botTable:game.botTable===true});
     game.seats=game.seats.map((s,i)=>({...s,score:result.scores[i],value:values[i]}));
     game.state='finished';
+    game.discoverable=false;
     game.result={winner:result.winner,reason,values,pot:pay.pot,payouts:pay.payouts,taker:pay.taker};
     if(result.winner!=null && game.seats[result.winner]?.bot)count('botWins');
     if(pay.pot) {
@@ -343,7 +348,103 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
     return {state:game.state};
   }
 
+  async function joinSeat(tx,ref,me,now,publicOnly=false) {
+    const t=await load(tx,ref);
+    const game=t.game;
+    if(t.me>=0)return {gameId:ref.id,handId:t.secret.handIds[t.me],code:game.code};
+    if((game.kicked ?? []).includes(player))throw new HttpsError('permission-denied','removed');
+    if(game.state!=='lobby' || (game.expiresMs ?? 0)<=now)
+      throw new HttpsError('failed-precondition','started');
+    if(publicOnly) {
+      if(game.visibility!=='public')throw new HttpsError('failed-precondition','private');
+      const host=await tx.get(playerRef(game.host));
+      if((host.get('onlineUntilMs') ?? 0)<=now || game.seats.find(s=>s.id===game.host)?.away)
+        throw new HttpsError('failed-precondition','unavailable');
+    }
+    if(game.seats.length>=maxSeats(game))throw new HttpsError('failed-precondition','full');
+    covers(game.settings.stake);
+    const handId=newHandId();
+    const seats=[...game.seats.map(unready),seat(player,me,now)];
+    tx.update(ref,{seats,discoverable:discoverable({...game,seats}),...stamp()});
+    tx.set(t.privateRef,kept({...t.secret,handIds:[...t.secret.handIds,handId]}));
+    count('joins');
+    if(publicOnly)count('publicJoins');
+    return {gameId:ref.id,handId,code:game.code};
+  }
+
   switch(data.action) {
+  case 'browseLobby': {
+    const now=Date.now();
+    const [gamesPage,visitorsPage]=await Promise.all([
+      games.where('discoverable','==',true).orderBy('createdMs','desc').limit(lobbyRoomsLimit*2).get(),
+      root.collection('players').where('lobbyUntilMs','>',now).orderBy('lobbyUntilMs','desc')
+        .limit(lobbyVisitorsLimit+1).get(),
+    ]);
+    const candidates=gamesPage.docs.map(doc=>({id:doc.id,...doc.data()})).filter(game=>
+      discoverable(game) && (game.state==='playing' || game.expiresMs>now) &&
+      !(game.kicked ?? []).includes(player));
+    const hosts=[...new Set(candidates.filter(game=>game.state==='lobby').map(game=>game.host))];
+    const hostDocs=hosts.length ? await db.getAll(...hosts.map(playerRef)) : [];
+    const online=new Set(hostDocs.filter(doc=>(doc.get('onlineUntilMs') ?? 0)>now).map(doc=>doc.id));
+    const listed=candidates.filter(game=>game.state==='playing' || !joinable(game) ||
+      (online.has(game.host) && !game.seats.find(s=>s.id===game.host)?.away));
+    const status=game=>game.state==='playing' ? 'playing' : joinable(game) ? 'available' : 'full';
+    const priority={available:0,full:1,playing:2};
+    listed.sort((a,b)=>priority[status(a)]-priority[status(b)] || b.createdMs-a.createdMs);
+    const visible=listed.slice(0,lobbyRoomsLimit);
+    const allRooms=visible.map(game=>({
+      gameId:game.id,host:game.seats.find(s=>s.id===game.host)?.nickname ?? 'שחקן',
+      seats:game.seats.filter(s=>!s.left).length,maxPlayers:maxSeats(game),
+      bots:game.seats.filter(s=>s.bot && !s.left).length,
+      stake:game.settings.stake ?? 0,rackSize:game.settings.rackSize,
+      turnSeconds:game.settings.turnSeconds,colors:game.settings.colors ?? 1,
+      status:status(game),
+    }));
+    const activeVisitors=visitorsPage.docs.filter(doc=>doc.id!==player).slice(0,lobbyVisitorsLimit);
+    const people=new Map(activeVisitors.map(doc=>[doc.id,{nickname:doc.get('lobbyNickname') ?? 'שחקן',busy:false}]));
+    // A seat in a public room is busy even before the game starts: its host is no longer browsing.
+    for(const game of visible) {
+      for(const seat of game.seats.filter(seat=>!seat.bot && !seat.left && seat.id!==player))
+        people.set(seat.id,{nickname:seat.nickname,busy:true,roomId:game.id});
+    }
+    const players=[...people.values()].sort((a,b)=>Number(a.busy)-Number(b.busy) ||
+      a.nickname.localeCompare(b.nickname,'he'));
+    // Older app builds still read these keys and never offer a full or started room as joinable.
+    const rooms=allRooms.filter(room=>room.status==='available');
+    const visitors=activeVisitors.map(doc=>doc.get('lobbyNickname') ?? 'שחקן');
+    return reply({rooms,visitors,allRooms,players});
+  }
+
+  case 'lobbyPresence': {
+    if(!['open','pulse','close'].includes(data.mode) ||
+       typeof data.session!=='string' || !/^[0-9a-f]{32}$/.test(data.session))
+      throw new HttpsError('invalid-argument','Invalid lobby presence');
+    const me=data.mode==='open' ? await details() : null;
+    return reply(await runTx(async tx=>{
+      const ref=playerRef(player);
+      const old=await tx.get(ref);
+      const now=Date.now();
+      const closed=old.get('lobbyClosedSessions') ?? [];
+      if(data.mode==='open') {
+        if(closed.includes(data.session))return {online:false};
+        tx.set(ref,{lobbySession:data.session,lobbyUntilMs:now+presenceLeaseMs,
+          lobbyNickname:me.nickname,expireAt:Timestamp.fromMillis(now+playerKeepMs)},{merge:true});
+        return {online:true};
+      }
+      if(data.mode==='close') {
+        const lobbyClosedSessions=[...new Set([...closed,data.session])].slice(-8);
+        if(!old.exists || old.get('lobbySession')===data.session)
+          tx.set(ref,{lobbySession:data.session,lobbyClosedSessions,lobbyUntilMs:0,
+            expireAt:Timestamp.fromMillis(now+playerKeepMs)},{merge:true});
+        else tx.update(ref,{lobbyClosedSessions});
+        return {online:false};
+      }
+      if(old.get('lobbySession')!==data.session || closed.includes(data.session))return {online:false};
+      tx.update(ref,{lobbyUntilMs:now+presenceLeaseMs});
+      return {online:true};
+    }));
+  }
+
   // A short lease says that the whole app is in front, including outside the word table.
   // Recent close tombstones prevent in-flight opens and pulses from restoring a closed session.
   case 'presence': {
@@ -393,13 +494,17 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
   }
 
   case 'create': {
+    if(data.visibility!==undefined && !['private','public'].includes(data.visibility))
+      throw new HttpsError('invalid-argument','Invalid visibility');
+    if(data.maxPlayers!==undefined && !tableRules.maxPlayersOptions.includes(data.maxPlayers))
+      throw new HttpsError('invalid-argument','Invalid capacity');
     const me=await details();
     await register(me);
     const tuning=await tuningFor(db,env);
     const stake=chooseStake(tuning,data.stake,balance);
     if(stake==null)throw new HttpsError('failed-precondition',balance===undefined ? 'update' : 'diamonds',{stake:tuning.options[0],balance});
     const settings=tableSettings({...data,stake},tuning);
-    return reply(await runTx(tx=>openLobby(tx,me,settings,Date.now())));
+    return reply(await runTx(tx=>openLobby(tx,me,settings,Date.now(),null,1,[],data.visibility ?? 'private')));
   }
 
   case 'join': {
@@ -411,25 +516,23 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       const now=Date.now();
       const doc=await tx.get(invite);
       if(!doc.exists || doc.get('expiresMs')<=now)throw new HttpsError('not-found','expired');
-      const ref=games.doc(doc.get('gameId'));
-      const t=await load(tx,ref);
-      if(t.me>=0)return {gameId:ref.id,handId:t.secret.handIds[t.me],code:t.game.code};
-      // The host removed this player from this table: not again by the code (README.md, "Removing a player").
-      if((t.game.kicked ?? []).includes(player))throw new HttpsError('permission-denied','removed');
-      if(t.game.state!=='lobby')throw new HttpsError(t.game.state==='cancelled' ? 'not-found' : 'failed-precondition',
-        t.game.state==='cancelled' ? 'expired' : 'started');
-      if(t.game.seats.length>=tableRules.maxPlayers)throw new HttpsError('failed-precondition','full');
-      covers(t.game.settings.stake);
-      const handId=newHandId();
-      tx.update(ref,{seats:[...t.game.seats,seat(player,me,now)],...stamp()});
-      tx.set(t.privateRef,kept({...t.secret,handIds:[...t.secret.handIds,handId]}));
-      count('joins');
-      return {gameId:ref.id,handId,code:t.game.code};
+      return joinSeat(tx,games.doc(doc.get('gameId')),me,now);
     }));
+  }
+
+  case 'joinPublic': {
+    const me=await details();
+    await register(me);
+    const ref=gameRef();
+    return reply(await runTx(tx=>joinSeat(tx,ref,me,Date.now(),true)));
   }
 
   case 'settings': {
     const ref=gameRef();
+    if(data.visibility!==undefined && !['private','public'].includes(data.visibility))
+      throw new HttpsError('invalid-argument','Invalid visibility');
+    if(data.maxPlayers!==undefined && !tableRules.maxPlayersOptions.includes(data.maxPlayers))
+      throw new HttpsError('invalid-argument','Invalid capacity');
     const tuning=await tuningFor(db,env);
     return reply(await runTx(async tx=>{
       const t=await load(tx,ref);
@@ -439,10 +542,14 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       const offered=tuning.options.includes(t.game.settings.stake) ? tuning
         : {...tuning,options:[...tuning.options,t.game.settings.stake ?? 0]};
       const settings=tableSettings({...t.game.settings,...data},offered);
+      if(settings.maxPlayers<t.game.seats.length)throw new HttpsError('failed-precondition','occupied');
       if(settings.stake!==(t.game.settings.stake ?? 0))covers(settings.stake);
-      const changed=Object.keys(settings).some(key=>settings[key]!==t.game.settings[key]);
-      tx.update(ref,{settings,seats:changed ? t.game.seats.map(unready) : t.game.seats,...stamp()});
-      return {settings};
+      const changed=['rackSize','turnSeconds','colors','stake'].some(key=>settings[key]!==t.game.settings[key]);
+      const visibility=data.visibility ?? t.game.visibility ?? 'private';
+      const game={...t.game,settings,visibility};
+      tx.update(ref,{settings,visibility,discoverable:discoverable(game),
+        seats:changed ? t.game.seats.map(unready) : t.game.seats,...stamp()});
+      return {settings,visibility};
     }));
   }
 
@@ -479,6 +586,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       const {hands,pool}=deal(game.seats.length,game.settings.rackSize);
       const first=Math.floor(Math.random()*game.seats.length);
       game.state='playing';
+      game.discoverable=discoverable(game);
       game.startedMs=now;
       // The cut is fixed when the game starts, so a change in StageAdmin never touches a game being played.
       game.houseCut=tuning.houseCut;
@@ -655,16 +763,17 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       const me=t.me;
       const invite=root.collection('invites').doc(game.code);
       if(game.state==='lobby') {
-        const seats=game.seats.filter((s,i)=>i!==me);
+        const seats=game.seats.filter((s,i)=>i!==me).map(unready);
         const handIds=t.secret.handIds.filter((h,i)=>i!==me);
         const humans=seats.filter(s=>!s.bot);
         // The next human hosts; a table left with bots only closes.
         if(!humans.length) {
-          tx.update(ref,{seats,state:'cancelled',finishedMs:now,...stamp()});
+          tx.update(ref,{seats,state:'cancelled',discoverable:false,finishedMs:now,...stamp()});
           tx.delete(invite);
           count('lobbiesClosed');
         } else {
-          tx.update(ref,{seats,host:game.host===player ? humans[0].id : game.host,...stamp()});
+          tx.update(ref,{seats,host:game.host===player ? humans[0].id : game.host,
+            discoverable:discoverable({...game,seats}),...stamp()});
         }
         tx.set(t.privateRef,kept({...t.secret,handIds}));
         return {state:humans.length ? 'lobby' : 'cancelled'};
@@ -787,7 +896,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       if(game.state!=='lobby')throw new HttpsError('failed-precondition','started');
       if(game.seats.some(s=>s.id===friend))throw new HttpsError('failed-precondition','seated');
       if((game.kicked ?? []).includes(friend))throw new HttpsError('failed-precondition','removed');
-      if(game.seats.length>=tableRules.maxPlayers)throw new HttpsError('failed-precondition','full');
+      if(game.seats.length>=maxSeats(game))throw new HttpsError('failed-precondition','full');
       const [friendDoc,meDoc]=await tx.getAll(playerRef(friend),playerRef(player));
       const inbox=friendDoc.get('inbox');
       if(!friendDoc.exists || typeof inbox!=='string')throw new HttpsError('not-found','unknown-friend');
@@ -820,9 +929,10 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       if(game.host!==player)throw new HttpsError('permission-denied','Only the host');
       if(game.state!=='lobby')refuse('not-playing');
       if(data.action==='addBot') {
-        if(game.seats.length>=tableRules.maxPlayers)throw new HttpsError('failed-precondition','full');
+        if(game.seats.length>=maxSeats(game))throw new HttpsError('failed-precondition','full');
         const bot=botSeat(game.seats,data.level ?? botRules.level,now,newBotId());
-        tx.update(ref,{seats:[...game.seats.map(unready),bot],...stamp()});
+        const seats=[...game.seats.map(unready),bot];
+        tx.update(ref,{seats,discoverable:discoverable({...game,seats}),...stamp()});
         tx.set(t.privateRef,kept({...t.secret,handIds:[...t.secret.handIds,newHandId()]}));
         count('botsAdded');
         return {bot:bot.id};
@@ -830,7 +940,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       const index=game.seats.findIndex(s=>s.bot && s.id===data.bot);
       if(index<0)throw new HttpsError('not-found','No such bot');
       if(data.action==='removeBot') {
-        tx.update(ref,{seats:game.seats.filter((s,i)=>i!==index).map(unready),...stamp()});
+        const seats=game.seats.filter((s,i)=>i!==index).map(unready);
+        tx.update(ref,{seats,discoverable:discoverable({...game,seats}),...stamp()});
         tx.set(t.privateRef,kept({...t.secret,handIds:t.secret.handIds.filter((h,i)=>i!==index)}));
         return {bot:data.bot};
       }
@@ -855,7 +966,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       if(data.player===player)throw new HttpsError('invalid-argument','Not yourself');
       const out=kickSeat(game.seats,t.secret.handIds,game.kicked,data.player,game.host);
       if(!out)return {removed:false};
-      tx.update(ref,{seats:out.seats,kicked:out.kicked,...stamp()});
+      const seats=out.seats.map(unready);
+      tx.update(ref,{seats,kicked:out.kicked,discoverable:discoverable({...game,seats}),...stamp()});
       tx.set(t.privateRef,kept({...t.secret,handIds:out.handIds}));
       count('kicks');
       return {removed:true};
@@ -880,10 +992,11 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
         if(n.me>=0)return {gameId:nextRef.id,handId:n.secret.handIds[n.me],code:n.game.code};
         if((n.game.kicked ?? []).includes(player))throw new HttpsError('permission-denied','removed');
         if(n.game.state!=='lobby')throw new HttpsError('failed-precondition','started');
-        if(n.game.seats.length>=tableRules.maxPlayers)throw new HttpsError('failed-precondition','full');
+        if(n.game.seats.length>=maxSeats(n.game))throw new HttpsError('failed-precondition','full');
         covers(n.game.settings.stake);
         const handId=newHandId();
-        tx.update(nextRef,{seats:[...n.game.seats,seat(player,me,now)],...stamp()});
+        const seats=[...n.game.seats.map(unready),seat(player,me,now)];
+        tx.update(nextRef,{seats,discoverable:discoverable({...n.game,seats}),...stamp()});
         tx.set(n.privateRef,kept({...n.secret,handIds:[...n.secret.handIds,handId]}));
         return {gameId:nextRef.id,handId,code:n.game.code};
       }

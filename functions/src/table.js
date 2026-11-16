@@ -24,19 +24,26 @@ const TILE=new Map(TILES.map(t=>[t.id,t]));
 export const tileOf=id=>TILE.get(id);
 
 export const tableRules={minPlayers:2,maxPlayers:4,minWordLength:3,openingPoints:10,timeoutPenalty:3,jokerHandPenalty:8,
+  maxPlayersOptions:[2,3,4],
   rackSizes:[12,14,16,18,21],rackSize:14,turnSecondsOptions:[30,60,90,120],turnSeconds:60,
-  colorOptions:[1,2,3,4],colors:1,colorChance:0.5,
+  colorOptions:[1,2,3,4],colors:2,colorChance:0.5,
   lobbyMs:30*60_000,startDelayMs:3_000,graceMs:2_500,maxMissed:3,maxWords:60,maxWordTiles:24,logSize:30,
   voteMs:15_000,maxAsked:3};
 
 export function tableSettings(input={},tuning=tableTuning(null)) {
+  const maxPlayers=tableRules.maxPlayersOptions.includes(input.maxPlayers) ? input.maxPlayers : tableRules.maxPlayers;
   const rackSize=tableRules.rackSizes.includes(input.rackSize) ? input.rackSize : tableRules.rackSize;
   const turnSeconds=tableRules.turnSecondsOptions.includes(input.turnSeconds) ? input.turnSeconds : tableRules.turnSeconds;
   const colors=tableRules.colorOptions.includes(input.colors) ? input.colors : tableRules.colors;
   const stake=tuning.options.includes(input.stake) ? input.stake : tuning.options[0];
-  return {rackSize,turnSeconds,colors,stake,minWordLength:tableRules.minWordLength,openingPoints:tableRules.openingPoints,
+  return {rackSize,turnSeconds,colors,stake,maxPlayers,minWordLength:tableRules.minWordLength,openingPoints:tableRules.openingPoints,
     timeoutPenalty:tableRules.timeoutPenalty};
 }
+
+export const maxSeats=game=>game.settings?.maxPlayers ?? tableRules.maxPlayers;
+// Public waiting rooms and games in progress stay visible. Joining is a separate, stricter check.
+export const discoverable=game=>game.visibility==='public' && (game.state==='lobby' || game.state==='playing');
+export const joinable=game=>discoverable(game) && game.state==='lobby' && game.seats.length<maxSeats(game);
 
 // The price of a seat (README.md, "Diamonds"): the game's settings (`gameTuning/{env}`, key `wordTable`, edited in
 // StageAdmin's Games tab) list the prices a host may pick and whether a free table is one of them; every player pays

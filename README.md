@@ -32,6 +32,22 @@ AGPL. The game's apps are separate programs that talk to this server.
   - A word passes with a majority of everyone who may vote.
   - It then counts for that game only.
 
+## Public players lobby
+
+Tables start private. The host can make a waiting room public and set a 2–4
+player capacity; bots take seats too. `browseLobby` returns public waiting rooms
+and games in progress in `allRooms`, sorted with joinable rooms first. Full and
+started rooms carry disabled statuses. `players` lists active browsers as
+available and players seated in visible public rooms as busy, with
+available players first. The older `rooms` and `visitors` fields still return
+only joinable rooms and browser nicknames for existing app builds.
+`lobbyPresence` maintains those visitors with a 45-second lease. `joinPublic`
+claims a seat transactionally, with the same capacity and start checks used by
+code joins. Private, expired, finished, and host-offline available rooms are hidden.
+Rematches begin private. The `discoverable ASC, createdMs DESC` Firestore index
+is defined in the Android app repository's `firestore.indexes.json` and must
+be deployed before this function serves production traffic.
+
 ## The dictionary
 
 `functions/dictionary/he-v1.txt.gz` holds 346,469 keys: Hebrew letters only,
