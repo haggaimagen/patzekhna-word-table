@@ -12,18 +12,26 @@ import {getFirestore,FieldValue,Timestamp} from 'firebase-admin/firestore';
 import {onCall,HttpsError} from 'firebase-functions/v2/https';
 import {validatePlayerDetails,validCode,validMatchID,makeCode} from './players.js';
 import {boardNickname} from './nicknames.js';
-import {tableRules,tableSettings,tableTuning,chooseStake,payouts,deal,paint,checkPlay,handValue,nextSeat,finalScores,readAsked,tally}
+import {tableRules,tableSettings,tableTuning,chooseStake,payouts,deal,paint,checkPlay,handValue,nextSeat,finalScores,readAsked,tally,kickSeat}
   from './table.js';
 import {dictionaryVersion,withLists,listsFor} from './dictionary.js';
 import {statsDay,newTally,statsKey} from './stats.js';
+import {botRules,validLevel,thinkMs,findMove,isBotTable,botSeat,botReveal} from './bots.js';
 
 const actions=['create','join','settings','ready','start','draft','play','draw','timeout','leave','away','back','again',
   'presence','friendPresence',
-  'ask','vote','settle','inviteFriend'];
+  'ask','vote','settle','inviteFriend','addBot','removeBot','botLevel','kick'];
 // "The table has moved on", not a bad request: the app drops the move and follows the table.
 const stale=['stale','not-your-turn','not-playing','voting','starting'];
 
 const newHandId=()=>randomBytes(15).toString('base64url');
+const newBotId=()=>`bot-${randomBytes(6).toString('hex')}`;
+// Changing who sits at a lobby clears the players' readiness, as changing the settings does; bots stay ready.
+const unready=s=>s.bot ? s : {...s,ready:false};
+// A bot's turn begins with two moments: `botAt`, when it finds its move, and `botThink`, when the move is played (its
+// level's share of the clock).
+const botClock=(game,seat,startedMs)=>({botAt:startedMs+botRules.lookMs,
+  botThink:startedMs+Math.max(botRules.lookMs+1_000,thinkMs(game.seats[seat].level,game.settings.turnSeconds))});
 
 // How long a table stays after its last change: every write moves `expireAt` this far ahead, on the table, its hands,
 // its private state and its code, and Firestore's TTL policy on `expireAt` deletes what nobody touched since. A
@@ -62,7 +70,8 @@ function seat(id,details,now) {
     count:0,opened:false,ready:false,left:false,away:false,missed:0,score:null,value:null};
 }
 
-export const table=onCall({region:'europe-west1',maxInstances:10},async request=>{
+// 512 MiB: the bots' move finder indexes the dictionary by its letters once per instance (about 40 MB more).
+export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'},async request=>{
   const data=request.data;
   if(typeof data?.playerKey!=='string' || !/^[0-9a-f]{64}$/.test(data.playerKey))
     throw new HttpsError('invalid-argument','Invalid player');
@@ -129,9 +138,11 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       handRef:i=>ref.collection('hands').doc(secret.handIds[i])};
   }
   const mine=t=>{ if(t.me<0)throw new HttpsError('permission-denied','Not your table'); return t.me; };
+  // What each human pays when the game starts: against bots only, StageAdmin's flat price; otherwise the seat's price.
+  const priceOf=(game,tuning)=>isBotTable(game.seats) ? tuning.botPrice : (game.settings.stake ?? 0);
 
   // A new lobby with the caller as host, and a free code for it.
-  async function openLobby(tx,me,settings,now,previous=null,round=1) {
+  async function openLobby(tx,me,settings,now,previous=null,round=1,bots=[]) {
     let code, invite;
     for(let attempt=0;attempt<6 && !invite;attempt++) {
       code=makeCode();
@@ -143,10 +154,13 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     const ref=games.doc();
     const handId=newHandId();
     const expiresMs=now+tableRules.lobbyMs;
-    tx.set(ref,{state:'lobby',code,createdMs:now,expiresMs,host:player,settings,seats:[seat(player,me,now)],board:[],
+    // "עוד משחק" brings the bots along, at their levels.
+    const seats=[seat(player,me,now)];
+    for(const b of bots)seats.push(botSeat(seats,b.level,now,newBotId()));
+    tx.set(ref,{state:'lobby',code,createdMs:now,expiresMs,host:player,settings,seats,board:[],
       jokers:{},colors:{},accepted:[],vote:null,dictionary:dictionaryVersion,pool:0,turn:null,draft:null,log:[],passStreak:0,result:null,next:null,previous,round,startedMs:null,
       finishedMs:null,...stamp()});
-    tx.set(ref.collection('private').doc('state'),kept({pool:[],handIds:[handId]}));
+    tx.set(ref.collection('private').doc('state'),kept({pool:[],handIds:[handId,...bots.map(()=>newHandId())]}));
     tx.set(invite,{gameId:ref.id,expiresMs,expireAt:Timestamp.fromMillis(expiresMs+24*60*60_000)});
     count('tablesCreated');
     if(previous)count('againTables');
@@ -157,6 +171,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   function advance(game,now) {
     const seat=nextSeat(game.seats,game.turn.seat);
     game.turn={number:game.turn.number+1,seat,startedMs:now,endsAt:now+game.settings.turnSeconds*1000};
+    if(game.seats[seat]?.bot)Object.assign(game.turn,botClock(game,seat,now));
     game.draft=null;
     game.vote=null;
   }
@@ -166,10 +181,12 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   function finish(game,hands,winner,reason,now) {
     const values=game.seats.map((s,i)=>handValue(hands[i] ?? []));
     const result=finalScores(game.seats,values,winner);
-    const pay=payouts(game.seats,game.settings.stake ?? 0,game.houseCut ?? 0,result.winner);
+    const pay=payouts(game.seats,game.settings.stake ?? 0,game.houseCut ?? 0,result.winner,
+      {values,botTable:game.botTable===true});
     game.seats=game.seats.map((s,i)=>({...s,score:result.scores[i],value:values[i]}));
     game.state='finished';
-    game.result={winner:result.winner,reason,values,pot:pay.pot,payouts:pay.payouts};
+    game.result={winner:result.winner,reason,values,pot:pay.pot,payouts:pay.payouts,taker:pay.taker};
+    if(result.winner!=null && game.seats[result.winner]?.bot)count('botWins');
     if(pay.pot) {
       count('diamondsCut',pay.cut);
       count('diamondsPaidOut',pay.payouts.reduce((a,b)=>a+b,0));
@@ -182,11 +199,12 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     if(game.startedMs)count('durationMsSum',Math.max(0,now-game.startedMs));
     count('turnsSum',game.turn?.number ?? 0);
   }
-  // Ends the table if fewer than two are still in; true if it did.
+  // Ends the table if fewer than two are still in, or no human is; true if it did. With only bots left, the
+  // lowest hand among them is the winner, and the humans (all gone) forfeit.
   function lastOneStanding(game,hands,now) {
     const inGame=game.seats.map((s,i)=>i).filter(i=>!game.seats[i].left);
-    if(inGame.length>=2)return false;
-    finish(game,hands,inGame[0] ?? null,'left',now);
+    if(inGame.length>=2 && inGame.some(i=>!game.seats[i].bot))return false;
+    finish(game,hands,inGame.length===1 ? inGame[0] : null,'left',now);
     return true;
   }
   // Takes up to `count` from the pool into a hand.
@@ -206,7 +224,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     } catch(e) { throw new HttpsError('invalid-argument',e.message); }
   }
   // Puts a good turn on the table; true if the player went out and won.
-  function commitPlay(game,hands,secret,seatIndex,result,now,type='play') {
+  function commitPlay(game,hands,secret,seatIndex,result,now,type='play',bot=false) {
     const jokers={...game.jokers};
     for(const id of Object.keys(jokers))if(!result.board.some(w=>w.tiles.includes(id)))delete jokers[id];
     Object.assign(jokers,result.jokers);
@@ -217,21 +235,31 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     game.seats[seatIndex]={...game.seats[seatIndex],opened:true,count:result.hand.length,missed:0};
     game.passStreak=0;
     log(game,{type,seat:seatIndex,tiles:result.played.length,words:result.words.slice(0,8),opening},now);
-    count(type==='play' ? 'plays' : 'timeoutPlays');
-    count('tilesPlayed',result.played.length);
-    count('wordsMade',result.words.length);
-    if(opening)count('openings');
+    if(bot) {
+      count('botPlays');
+      count('botTiles',result.played.length);
+    } else {
+      count(type==='play' ? 'plays' : 'timeoutPlays');
+      count('tilesPlayed',result.played.length);
+      count('wordsMade',result.words.length);
+      if(opening)count('openings');
+    }
     if(result.hand.length===0) { finish(game,hands,seatIndex,'empty',now); return true; }
     return false;
   }
   // No play: one letter from the pool, or a pass when it is empty. A full round of passes ends the game.
-  function drawOrPass(game,hands,secret,seatIndex,now,type='draw') {
+  function drawOrPass(game,hands,secret,seatIndex,now,type='draw',bot=false) {
     const hand=[...hands[seatIndex]];
     const got=draw(secret,hand,1);
     hands[seatIndex]=hand;
     game.seats[seatIndex]={...game.seats[seatIndex],count:hand.length};
     game.pool=secret.pool.length;
-    if(got) { game.passStreak=0; log(game,{type,seat:seatIndex,count:1},now); count(type==='draw' ? 'draws' : 'timeoutDraws'); return false; }
+    if(got) {
+      game.passStreak=0;
+      log(game,{type,seat:seatIndex,count:1},now);
+      count(bot ? 'botDraws' : type==='draw' ? 'draws' : 'timeoutDraws');
+      return false;
+    }
     count('passes');
     game.passStreak=(game.passStreak ?? 0)+1;
     log(game,{type:'pass',seat:seatIndex},now);
@@ -251,8 +279,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
     if(game.turn.seat!==seatIndex)refuse('not-your-turn');
     if(Date.now()<game.turn.startedMs)refuse('starting');
   }
-  // Who may vote on a word the player on turn asked about: everyone else still at the table.
-  const voters=game=>game.seats.map((s,i)=>i).filter(i=>!game.seats[i].left && i!==game.vote?.by);
+  // Who may vote on a word the player on turn asked about: every other human still at the table (bots don't vote).
+  const voters=game=>game.seats.map((s,i)=>i).filter(i=>!game.seats[i].left && !game.seats[i].bot && i!==game.vote?.by);
   // Counts a vote, adds what passed to the table's own words, logs it, gives the turn back its clock, and keeps every
   // asked word for StageAdmin's review. Called by `settle` once the time is up, or by `vote` once all have voted.
   function settleVote(tx,game,now) {
@@ -271,6 +299,48 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
         lastMs:now,lastVotes:Object.keys(vote.votes ?? {}).length,lastVoters:eligible.length
       },{merge:true});
     }
+  }
+
+  // A bot's turn (bots.js), in two steps, each when a phone at the table calls `timeout` at `turn.botAt`. First the
+  // bot finds its move and saves it as its draft with the window its letters arrive in (`from`–`until`), and `botAt`
+  // moves to when it is played; then the draft is played. A bot with no move waits for its time, then draws. The
+  // rules check the move like any other; one they refuse (a word denied since) becomes a draw.
+  function botTurn(tx,ref,t,now) {
+    const game=t.game, seatIndex=game.turn.seat, bot=game.seats[seatIndex];
+    const hands=[...t.hands];
+    const safely=fn=>{ try { return fn(); } catch { return null; } };
+    const good=proposal=>{ const r=proposal && safely(()=>judge(game,hands[seatIndex],seatIndex,proposal)); return r && !r.errors.length ? r : null; };
+    let over;
+    if(game.draft?.turn===game.turn.number && game.draft.bot) {
+      const result=good(game.draft);
+      over=result ? commitPlay(game,hands,t.secret,seatIndex,result,now,'play',true)
+        : drawOrPass(game,hands,t.secret,seatIndex,now,'draw',true);
+    } else if(game.turn.botPlan==='draw') {
+      over=drawOrPass(game,hands,t.secret,seatIndex,now,'draw',true);
+    } else {
+      const result=good(safely(()=>findMove({board:game.board,jokers:game.jokers,colors:game.colors ?? {},
+        hand:hands[seatIndex],opened:bot.opened,settings:game.settings,isWord:wordCheck,accepted:game.accepted ?? [],
+        turn:game.turn.number},bot.level)));
+      const think=game.turn.botThink ?? now;
+      if(result) {
+        const {from,until,commitAt}=botReveal(bot.level,result.played.length,now,think,game.turn.endsAt);
+        game.draft={turn:game.turn.number,board:result.board,jokers:result.jokers,at:now,bot:true,from,until};
+        game.turn={...game.turn,botAt:commitAt};
+        tx.set(ref,saved(game));
+        return {state:game.state,retryInMs:commitAt-now};
+      }
+      if(now<think) {
+        game.turn={...game.turn,botAt:think,botPlan:'draw'};
+        tx.set(ref,saved(game));
+        return {state:game.state,retryInMs:think-now};
+      }
+      over=drawOrPass(game,hands,t.secret,seatIndex,now,'draw',true);
+    }
+    if(!over)advance(game,now);
+    tx.set(ref,saved(game));
+    tx.set(t.privateRef,kept(t.secret));
+    writeHands(tx,t,hands,t.hands);
+    return {state:game.state};
   }
 
   switch(data.action) {
@@ -344,6 +414,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       const ref=games.doc(doc.get('gameId'));
       const t=await load(tx,ref);
       if(t.me>=0)return {gameId:ref.id,handId:t.secret.handIds[t.me],code:t.game.code};
+      // The host removed this player from this table: not again by the code (README.md, "Removing a player").
+      if((t.game.kicked ?? []).includes(player))throw new HttpsError('permission-denied','removed');
       if(t.game.state!=='lobby')throw new HttpsError(t.game.state==='cancelled' ? 'not-found' : 'failed-precondition',
         t.game.state==='cancelled' ? 'expired' : 'started');
       if(t.game.seats.length>=tableRules.maxPlayers)throw new HttpsError('failed-precondition','full');
@@ -369,7 +441,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       const settings=tableSettings({...t.game.settings,...data},offered);
       if(settings.stake!==(t.game.settings.stake ?? 0))covers(settings.stake);
       const changed=Object.keys(settings).some(key=>settings[key]!==t.game.settings[key]);
-      tx.update(ref,{settings,seats:changed ? t.game.seats.map(s=>({...s,ready:false})) : t.game.seats,...stamp()});
+      tx.update(ref,{settings,seats:changed ? t.game.seats.map(unready) : t.game.seats,...stamp()});
       return {settings};
     }));
   }
@@ -377,11 +449,12 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
   case 'ready': {
     const ref=gameRef();
     if(typeof data.ready!=='boolean')throw new HttpsError('invalid-argument','Invalid readiness');
+    const tuning=await tuningFor(db,env);
     return reply(await runTx(async tx=>{
       const t=await load(tx,ref);
       const me=mine(t);
       if(t.game.state!=='lobby')refuse('not-playing');
-      if(data.ready)covers(t.game.settings.stake);
+      if(data.ready)covers(priceOf(t.game,tuning));
       const seats=t.game.seats.map((s,i)=>i===me ? {...s,ready:data.ready} : s);
       tx.update(ref,{seats,...stamp()});
       return {ready:data.ready};
@@ -399,18 +472,24 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       if(game.state!=='lobby')return {state:game.state};
       if(game.seats.length<tableRules.minPlayers)throw new HttpsError('failed-precondition','alone');
       if(game.seats.some(s=>!s.ready))throw new HttpsError('failed-precondition','not-ready');
-      covers(game.settings.stake);
+      // Bots never pay; a table of the host and bots only costs the host StageAdmin's flat price, with no pot.
+      const botTable=isBotTable(game.seats);
+      const price=priceOf(game,tuning);
+      covers(price);
       const {hands,pool}=deal(game.seats.length,game.settings.rackSize);
       const first=Math.floor(Math.random()*game.seats.length);
       game.state='playing';
       game.startedMs=now;
       // The cut is fixed when the game starts, so a change in StageAdmin never touches a game being played.
       game.houseCut=tuning.houseCut;
+      game.botTable=botTable;
+      game.price=price;
       game.colors=paint(game.settings.colors ?? 1);
       game.seats=game.seats.map((s,i)=>({...s,count:hands[i].length}));
       game.pool=pool.length;
       game.turn={number:1,seat:first,startedMs:now+tableRules.startDelayMs,
         endsAt:now+tableRules.startDelayMs+game.settings.turnSeconds*1000};
+      if(game.seats[first].bot)Object.assign(game.turn,botClock(game,first,game.turn.startedMs));
       tx.set(ref,saved(game));
       tx.set(t.privateRef,kept({...t.secret,pool}));
       writeHands(tx,t,hands);
@@ -420,9 +499,19 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       count(`rackSize.${statsKey(game.settings.rackSize)}`);
       count(`turnSeconds.${statsKey(game.settings.turnSeconds)}`);
       count(`colors.${statsKey(game.settings.colors ?? 1)}`);
-      for(const s of game.seats)count(`platforms.${statsKey(s.platform)}`);
-      count(`stakes.${statsKey(game.settings.stake ?? 0)}`);
-      if(game.settings.stake)count('diamondsStaked',game.settings.stake*game.seats.length);
+      const bots=game.seats.filter(s=>s.bot);
+      for(const s of game.seats)if(!s.bot)count(`platforms.${statsKey(s.platform)}`);
+      if(bots.length) {
+        count('botGames');
+        if(botTable)count('botOnlyGames');
+        for(const b of bots)count(`botLevels.${statsKey(b.level)}`);
+      }
+      if(botTable) {
+        if(price)count('botTableDiamonds',price);
+      } else {
+        count(`stakes.${statsKey(game.settings.stake ?? 0)}`);
+        if(game.settings.stake)count('diamondsStaked',game.settings.stake*(game.seats.length-bots.length));
+      }
       return {state:'playing'};
     }));
   }
@@ -508,6 +597,12 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       // The clock stands still while the table votes; `settle` gives it back.
       if(game.vote)return {state:game.state,voting:true,retryInMs:Math.max(1_000,game.vote.endsAt+tableRules.graceMs-now)};
       const seatIndex=game.turn.seat;
+      // A bot's turn: played when its moment comes (bots.js), whoever calls.
+      if(game.seats[seatIndex].bot) {
+        const due=game.turn.botAt ?? game.turn.startedMs;
+        if(now<due)return {state:game.state,retryInMs:due-now};
+        return botTurn(tx,ref,t,now);
+      }
       const own=caller===seatIndex;
       const due=own ? game.turn.endsAt-1_000 : game.turn.endsAt+tableRules.graceMs;
       if(now<due)return {state:game.state,retryInMs:due-now};
@@ -562,15 +657,17 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       if(game.state==='lobby') {
         const seats=game.seats.filter((s,i)=>i!==me);
         const handIds=t.secret.handIds.filter((h,i)=>i!==me);
-        if(!seats.length) {
+        const humans=seats.filter(s=>!s.bot);
+        // The next human hosts; a table left with bots only closes.
+        if(!humans.length) {
           tx.update(ref,{seats,state:'cancelled',finishedMs:now,...stamp()});
           tx.delete(invite);
           count('lobbiesClosed');
         } else {
-          tx.update(ref,{seats,host:game.host===player ? seats[0].id : game.host,...stamp()});
+          tx.update(ref,{seats,host:game.host===player ? humans[0].id : game.host,...stamp()});
         }
         tx.set(t.privateRef,kept({...t.secret,handIds}));
-        return {state:seats.length ? 'lobby' : 'cancelled'};
+        return {state:humans.length ? 'lobby' : 'cancelled'};
       }
       if(game.state==='playing') {
         if(game.seats[me].left)return {state:game.state};
@@ -616,6 +713,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       onTurn(game,me);
       if(game.vote)refuse('voting');
       if(game.turn.asked)throw new HttpsError('failed-precondition','asked');
+      // Only humans vote; against bots only there is nobody to ask.
+      if(!voters({...game,vote:{by:me}}).length)throw new HttpsError('failed-precondition','no-voters');
       if(now>game.turn.endsAt)refuse('stale','Time is up');
       let words;
       try { words=readAsked(data.words,wordCheck,game.accepted ?? []); }
@@ -687,6 +786,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       const game=t.game;
       if(game.state!=='lobby')throw new HttpsError('failed-precondition','started');
       if(game.seats.some(s=>s.id===friend))throw new HttpsError('failed-precondition','seated');
+      if((game.kicked ?? []).includes(friend))throw new HttpsError('failed-precondition','removed');
       if(game.seats.length>=tableRules.maxPlayers)throw new HttpsError('failed-precondition','full');
       const [friendDoc,meDoc]=await tx.getAll(playerRef(friend),playerRef(player));
       const inbox=friendDoc.get('inbox');
@@ -702,6 +802,63 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       tx.set(playerRef(player),{invitesSent:[...recent,now]},{merge:true});
       count('friendInvites');
       return {sent:true};
+    }));
+  }
+
+  // Bots in the lobby (README.md, "Bots"), the host's to add, remove and set the level of (1–5). A bot takes a seat
+  // like a player, is always ready, never pays and never collects. Each change clears the players' readiness.
+  case 'addBot': case 'removeBot': case 'botLevel': {
+    const ref=gameRef();
+    if(data.action!=='removeBot' && data.level!==undefined && !validLevel(data.level))
+      throw new HttpsError('invalid-argument','Invalid level');
+    if(data.action!=='addBot' && (typeof data.bot!=='string' || !/^bot-[0-9a-f]{12}$/.test(data.bot)))
+      throw new HttpsError('invalid-argument','Invalid bot');
+    return reply(await runTx(async tx=>{
+      const now=Date.now();
+      const t=await load(tx,ref);
+      const game=t.game;
+      if(game.host!==player)throw new HttpsError('permission-denied','Only the host');
+      if(game.state!=='lobby')refuse('not-playing');
+      if(data.action==='addBot') {
+        if(game.seats.length>=tableRules.maxPlayers)throw new HttpsError('failed-precondition','full');
+        const bot=botSeat(game.seats,data.level ?? botRules.level,now,newBotId());
+        tx.update(ref,{seats:[...game.seats.map(unready),bot],...stamp()});
+        tx.set(t.privateRef,kept({...t.secret,handIds:[...t.secret.handIds,newHandId()]}));
+        count('botsAdded');
+        return {bot:bot.id};
+      }
+      const index=game.seats.findIndex(s=>s.bot && s.id===data.bot);
+      if(index<0)throw new HttpsError('not-found','No such bot');
+      if(data.action==='removeBot') {
+        tx.update(ref,{seats:game.seats.filter((s,i)=>i!==index).map(unready),...stamp()});
+        tx.set(t.privateRef,kept({...t.secret,handIds:t.secret.handIds.filter((h,i)=>i!==index)}));
+        return {bot:data.bot};
+      }
+      if(data.level===undefined)throw new HttpsError('invalid-argument','Invalid level');
+      if(game.seats[index].level===data.level)return {bot:data.bot};
+      tx.update(ref,{seats:game.seats.map((s,i)=>i===index ? {...s,level:data.level} : unready(s)),...stamp()});
+      return {bot:data.bot};
+    }));
+  }
+
+  // The host removes a player from the lobby (README.md, "Removing a player"): their seat goes, and the table keeps
+  // their id in `kicked`, so the code no longer lets them in. Their phone sees itself gone and in `kicked`, and says
+  // so. Only in the lobby: a game being played is left only by the player.
+  case 'kick': {
+    const ref=gameRef();
+    if(typeof data.player!=='string' || !/^[0-9a-f]{64}$/.test(data.player))throw new HttpsError('invalid-argument','Invalid player');
+    return reply(await runTx(async tx=>{
+      const t=await load(tx,ref);
+      const game=t.game;
+      if(game.host!==player)throw new HttpsError('permission-denied','Only the host');
+      if(game.state!=='lobby')refuse('not-playing');
+      if(data.player===player)throw new HttpsError('invalid-argument','Not yourself');
+      const out=kickSeat(game.seats,t.secret.handIds,game.kicked,data.player,game.host);
+      if(!out)return {removed:false};
+      tx.update(ref,{seats:out.seats,kicked:out.kicked,...stamp()});
+      tx.set(t.privateRef,kept({...t.secret,handIds:out.handIds}));
+      count('kicks');
+      return {removed:true};
     }));
   }
 
@@ -721,6 +878,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
         const nextRef=games.doc(t.game.next);
         const n=await load(tx,nextRef);
         if(n.me>=0)return {gameId:nextRef.id,handId:n.secret.handIds[n.me],code:n.game.code};
+        if((n.game.kicked ?? []).includes(player))throw new HttpsError('permission-denied','removed');
         if(n.game.state!=='lobby')throw new HttpsError('failed-precondition','started');
         if(n.game.seats.length>=tableRules.maxPlayers)throw new HttpsError('failed-precondition','full');
         covers(n.game.settings.stake);
@@ -733,7 +891,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10},async request=
       const stake=chooseStake(tuning,t.game.settings.stake ?? 0,balance);
       if(stake==null)throw new HttpsError('failed-precondition',balance===undefined ? 'update' : 'diamonds',
         {stake:t.game.settings.stake,balance});
-      const lobby=await openLobby(tx,me,{...t.game.settings,stake},now,ref.id,(t.game.round ?? 1)+1);
+      const lobby=await openLobby(tx,me,{...t.game.settings,stake},now,ref.id,(t.game.round ?? 1)+1,
+        t.game.seats.filter(s=>s.bot));
       tx.update(ref,{next:lobby.gameId,...stamp()});
       return lobby;
     }));

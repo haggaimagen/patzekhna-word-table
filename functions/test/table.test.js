@@ -3,7 +3,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {TILES,ALPHABET,tileOf,tableRules,tableSettings,tableTuning,chooseStake,payouts,deal,paint,colorOf,wordText,wordKey,checkPlay,handValue,nextSeat,
-  finalScores,readBoard,readAsked,tally} from '../src/table.js';
+  finalScores,readBoard,readAsked,tally,kickSeat} from '../src/table.js';
 import {isWord,dictionarySize,dictionaryVersion,withLists} from '../src/dictionary.js';
 
 // Tile ids by letter, in box order: ids('ש',2) → the first two ש tiles.
@@ -28,8 +28,9 @@ test('the box: 106 tiles, 104 letters and 2 jokers, fixed ids', ()=>{
 });
 
 test('settings take only the offered choices', ()=>{
-  assert.deepEqual(tableSettings({rackSize:7,turnSeconds:30}).rackSize,7);
+  assert.deepEqual(tableSettings({rackSize:12,turnSeconds:30}).rackSize,12);
   assert.equal(tableSettings({rackSize:9}).rackSize,14);
+  assert.equal(tableSettings({rackSize:7}).rackSize,14,'7 and 10 are no longer offered');
   assert.equal(tableSettings({turnSeconds:5}).turnSeconds,60);
 });
 
@@ -260,10 +261,19 @@ test('prices: a host gets the price they can pay', ()=>{
 
 test('prices: the winner takes the pot less the cut; no winner gives each seat back its price', ()=>{
   const seats=[{},{},{left:true},{}];
-  assert.deepEqual(payouts(seats,50,10,1),{pot:200,cut:20,payouts:[0,180,0,0]});
-  assert.deepEqual(payouts(seats.slice(0,2),25,10,0),{pot:50,cut:5,payouts:[45,0]});
-  assert.deepEqual(payouts(seats.slice(0,3),20,15,0),{pot:60,cut:9,payouts:[51,0,0]},'rounded for the house');
-  assert.deepEqual(payouts(seats,50,10,null),{pot:200,cut:0,payouts:[50,50,0,50]});
+  assert.deepEqual(payouts(seats,50,10,1),{pot:200,cut:20,taker:1,payouts:[0,180,0,0]});
+  assert.deepEqual(payouts(seats.slice(0,2),25,10,0),{pot:50,cut:5,taker:0,payouts:[45,0]});
+  assert.deepEqual(payouts(seats.slice(0,3),20,15,0),{pot:60,cut:9,taker:0,payouts:[51,0,0]},'rounded for the house');
+  assert.deepEqual(payouts(seats,50,10,null),{pot:200,cut:0,taker:null,payouts:[50,50,0,50]});
   assert.deepEqual(payouts(seats,0,10,1).payouts,[0,0,0,0]);
 });
 
+test('removing a player: their seat and hand id go, and they are kept out', ()=>{
+  const seats=[{id:'h'},{id:'g'},{id:'bot-1',bot:true},{id:'m'}];
+  const out=kickSeat(seats,['h0','g0','b0','m0'],['x'],'g','h');
+  assert.deepEqual(out,{seats:[{id:'h'},{id:'bot-1',bot:true},{id:'m'}],handIds:['h0','b0','m0'],kicked:['x','g']});
+  assert.equal(kickSeat(seats,['h0','g0','b0','m0'],[],'h','h'),null,'not the host');
+  assert.equal(kickSeat(seats,['h0','g0','b0','m0'],[],'bot-1','h'),null,'a bot goes with removeBot');
+  assert.equal(kickSeat(seats,['h0','g0','b0','m0'],[],'z','h'),null,'nobody there');
+  assert.deepEqual(kickSeat(seats,['h0','g0','b0','m0'],['g'],'g','h').kicked,['g'],'kept once');
+});

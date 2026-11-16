@@ -64,7 +64,7 @@ async function giveHand(gameId,handId,tiles) {
 
 test('a lobby fills by code, the host starts, and each hand stays private',async()=>{
   const a=player(key('a'),'אריה'), b=player(key('b'),'דוב'), c=player(key('c'),'זאב');
-  const made=await table(a,'create',{rackSize:10,turnSeconds:90});
+  const made=await table(a,'create',{rackSize:16,turnSeconds:90});
   assert.match(made.code,/^[A-Z2-9]{6}$/);
   const joined=await table(b,'join',{code:made.code});
   assert.equal(joined.gameId,made.gameId);
@@ -75,12 +75,12 @@ test('a lobby fills by code, the host starts, and each hand stays private',async
   await fails(table(a,'start',{gameId:made.gameId}),'failed-precondition','not-ready');
   await ready(a,made.gameId);
   await ready(b,made.gameId);
-  await table(a,'settings',{gameId:made.gameId,rackSize:7,colors:3});
+  await table(a,'settings',{gameId:made.gameId,rackSize:12,colors:3});
   await table(c,'join',{code:made.code});
   await table(c,'leave',{gameId:made.gameId});
   let g=await game(made.gameId);
   assert.equal(g.seats.length,2);
-  assert.equal(g.settings.rackSize,7);
+  assert.equal(g.settings.rackSize,12);
   assert.equal(g.settings.turnSeconds,90);
   assert.equal(g.settings.colors,3);
   assert.deepEqual(g.seats.map(s=>s.ready),[false,false],'settings changes clear consent');
@@ -92,10 +92,10 @@ test('a lobby fills by code, the host starts, and each hand stays private',async
   assert.equal(g.state,'playing');
   assert.equal(g.turn.startedMs-g.startedMs,3_000,'the countdown is three seconds on the server clock');
   assert.ok(g.turn.startedMs>Date.now(),'all phones get a countdown before the first turn');
-  assert.equal(g.pool,106-14);
-  assert.deepEqual(g.seats.map(s=>s.count),[7,7]);
+  assert.equal(g.pool,106-24);
+  assert.deepEqual(g.seats.map(s=>s.count),[12,12]);
   assert.ok(Object.keys(g.colors).length>20,'about half the letters painted');
-  assert.equal((await hand(made.gameId,made.handId)).length,7);
+  assert.equal((await hand(made.gameId,made.handId)).length,12);
   assert.equal(JSON.stringify(g).includes(key('a')),false,'the device key itself is never stored');
   assert.equal(JSON.stringify(g).includes(made.handId),false,'no hand id on the public table');
   await fails(table(c,'join',{code:made.code}),'not-found');
@@ -168,7 +168,7 @@ test('turns: an opening play, a draw, a broken board at timeout, leaving ends th
 
 test('the player out of tiles wins and the others pay their hands',async()=>{
   const a=player(key('f'),'ארנב'), b=player(key('9'),'חתול');
-  const made=await table(a,'create',{rackSize:7});
+  const made=await table(a,'create',{rackSize:12});
   const joined=await table(b,'join',{code:made.code});
   await startNow(a,b,made.gameId);
   let g=await game(made.gameId);
@@ -295,7 +295,7 @@ test('statistics: one document a day, aggregated, with no player in it',async()=
   const day=db.doc(`tableStats/${env}/days/${statsDay()}`);
   const before=(await day.get()).data() ?? {};
   const a=player(key('c'),'שחף'), b=player(key('d'),'עגור');
-  const made=await table(a,'create',{rackSize:7,colors:2});
+  const made=await table(a,'create',{rackSize:12,colors:2});
   const joined=await table(b,'join',{code:made.code});
   await table(a,'ready',{gameId:made.gameId,ready:true}).catch(()=>{});
   await table(b,'ready',{gameId:made.gameId,ready:true}).catch(()=>{});
@@ -322,7 +322,7 @@ test('statistics: one document a day, aggregated, with no player in it',async()=
   assert.equal(grew('gamesFinished'),1);
   assert.equal(grewIn('ends','empty'),1);
   assert.equal(grewIn('players','2'),1);
-  assert.equal(grewIn('rackSize','7'),1);
+  assert.equal(grewIn('rackSize','12'),1);
   assert.equal(grewIn('colors','2'),1);
   assert.equal(grewIn('platforms','ios'),2);
   assert.equal(grewIn('refusals','nothing'),1);
@@ -357,4 +357,158 @@ test('prices: only players who can pay sit down, and the winner takes the pot le
   assert.equal(g.state,'finished');
   assert.equal(g.result.pot,40);
   assert.deepEqual(g.result.payouts,[36,0],'40 less 10%');
+});
+
+// Bots (README.md, "Bots"): the host's to add in the lobby; they play on the server when a phone calls `timeout`.
+const handIdOf=async(gameId,seat)=>(await db.doc(`tables/${env}/games/${gameId}/private/state`).get()).get('handIds')[seat];
+const putOnTurn=(gameId,seat)=>db.doc(`tables/${env}/games/${gameId}`)
+  .update({'turn.seat':seat,'turn.startedMs':Date.now()-1,'turn.botAt':Date.now()-1,draft:null,colors:{}});
+
+test('bots: the host seats them, they are always ready, play on the server, and a bot-only game costs its price',async()=>{
+  const {statsDay}=await import('../src/stats.js');
+  const day=db.doc(`tableStats/${env}/days/${statsDay()}`);
+  const before=(await day.get()).data() ?? {};
+  const a={...player(key('1'),'שועל'),balance:100}, b={...player(key('2'),'גמל'),balance:100};
+  const made=await table(a,'create',{stake:20});
+  const gameId=made.gameId;
+  const first=await table(a,'addBot',{gameId,level:5});
+  assert.match(first.bot,/^bot-[0-9a-f]{12}$/);
+  let g=await game(gameId);
+  assert.equal(g.seats.length,2);
+  assert.deepEqual({bot:g.seats[1].bot,ready:g.seats[1].ready,level:g.seats[1].level,platform:g.seats[1].platform},
+    {bot:true,ready:true,level:5,platform:'bot'});
+  // Only the host; levels 1–5; a full table takes no more.
+  await table(b,'join',{code:made.code});
+  await fails(table(b,'addBot',{gameId}),'permission-denied');
+  await fails(table(a,'botLevel',{gameId,bot:first.bot,level:6}),'invalid-argument');
+  await table(b,'ready',{gameId,ready:true});
+  await table(a,'botLevel',{gameId,bot:first.bot,level:1});
+  g=await game(gameId);
+  assert.equal(g.seats[2].level ?? g.seats.find(s=>s.bot).level,1);
+  assert.equal(g.seats.find(s=>s.id===id(b.playerKey)).ready,false,'a change of bots asks for readiness again');
+  const second=await table(a,'addBot',{gameId});
+  await fails(table(a,'addBot',{gameId}),'failed-precondition','full');
+  await table(a,'removeBot',{gameId,bot:second.bot});
+  await table(b,'leave',{gameId});
+  g=await game(gameId);
+  assert.deepEqual(g.seats.map(s=>!!s.bot),[false,true]);
+  assert.notEqual(g.seats[1].nickname,'');
+
+  // The host and a bot only: StageAdmin's bot price (10 by default), whatever the seat's price.
+  await fails(table({...a,balance:5},'ready',{gameId,ready:true}),'failed-precondition','diamonds');
+  await table(a,'ready',{gameId,ready:true});
+  await fails(table({...a,balance:5},'start',{gameId}),'failed-precondition','diamonds');
+  await table(a,'start',{gameId});
+  g=await game(gameId);
+  assert.equal(g.state,'playing');
+  assert.equal(g.botTable,true);
+  assert.equal(g.price,10);
+  if(g.turn.seat===1)assert.ok(g.turn.botAt>g.turn.startedMs,'a bot first: its moment is set');
+
+  // The bot's turn: a phone calls `timeout`; first the bot's move is saved as its draft, with the window its letters
+  // arrive in, one by one; then it is played.
+  await putOnTurn(gameId,1);
+  const used=new Set();
+  await giveHand(gameId,await handIdOf(gameId,1),[...spell('שלומ',used),...spell('ספר',used),...spell('ביתא',used)]);
+  g=await game(gameId);
+  const shown=await table(a,'timeout',{gameId,turn:g.turn.number});
+  assert.ok(shown.retryInMs>0);
+  g=await game(gameId);
+  assert.equal(g.draft.bot,true);
+  assert.ok(g.draft.board.length>=1);
+  assert.ok(g.draft.from<g.draft.until && g.draft.until<g.turn.botAt && g.turn.botAt<g.turn.endsAt,'letters, then the move');
+  const early=await table(a,'timeout',{gameId,turn:g.turn.number});
+  assert.ok(early.retryInMs>0,'not before the draft has shown');
+  await db.doc(`tables/${env}/games/${gameId}`).update({'turn.botAt':Date.now()-1});
+  await table(a,'timeout',{gameId,turn:g.turn.number});
+  g=await game(gameId);
+  const played=g.log.at(-1);
+  assert.ok(['play','end'].includes(played.type),played.type);
+  assert.equal(g.seats[1].opened,true);
+  assert.ok(g.seats[1].count<11);
+  assert.equal(g.seats[1].missed,0,'a bot never misses a turn');
+  if(g.state==='playing')assert.equal(g.turn.seat,0,'then the human');
+
+  // Nobody to ask against bots only.
+  if(g.state==='playing')await fails(table(a,'ask',{gameId,turn:g.turn.number,words:[{key:'קקקק',text:'קקקק'}]}),
+    'failed-precondition','no-voters');
+  // The human leaves: the game ends, with no pot.
+  await table(a,'leave',{gameId});
+  g=await game(gameId);
+  assert.equal(g.state,'finished');
+  assert.equal(g.result.pot,0);
+  assert.deepEqual(g.result.payouts,[0,0]);
+
+  const after=(await day.get()).data();
+  const grew=k=>(after[k] ?? 0)-(before[k] ?? 0);
+  assert.equal(grew('botsAdded'),2);
+  assert.equal(grew('botGames'),1);
+  assert.equal(grew('botOnlyGames'),1);
+  assert.equal((after.botLevels?.['1'] ?? 0)-(before.botLevels?.['1'] ?? 0),1);
+  assert.equal(grew('botPlays'),1);
+  assert.equal(grew('botTableDiamonds'),10);
+  assert.equal((after.platforms?.bot ?? 0)-(before.platforms?.bot ?? 0),0,'bots are not a platform');
+});
+
+test('bots: at a priced table they neither pay nor collect, and a bot that wins gives the pot to the best human',async()=>{
+  const a={...player(key('3'),'אייל'),balance:100}, b={...player(key('4'),'יעל'),balance:100};
+  const made=await table(a,'create',{stake:50});
+  const gameId=made.gameId;
+  await table(b,'join',{code:made.code});
+  await table(a,'addBot',{gameId,level:5});
+  await table(b,'ready',{gameId,ready:true});
+  await table(a,'ready',{gameId,ready:true});
+  await table(a,'start',{gameId});
+  let g=await game(gameId);
+  assert.equal(g.botTable,false);
+  assert.equal(g.price,50);
+  // The bot goes out in one move: its hand is two words, worth the opening together.
+  await putOnTurn(gameId,2);
+  const botHand=(()=>{ const u=new Set(); return [...spell('שלומ',u),...spell('ספר',u)]; })();
+  await giveHand(gameId,await handIdOf(gameId,2),botHand);
+  g=await game(gameId);
+  // The humans' hands: b's is the cheaper, so b takes the pot.
+  const used=new Set(botHand);
+  const cheap=TILES.filter(t=>!used.has(t.id) && !t.joker && t.value===1).slice(0,2).map(t=>t.id);
+  await giveHand(gameId,await handIdOf(gameId,1),cheap);
+  await table(a,'timeout',{gameId,turn:g.turn.number});
+  await db.doc(`tables/${env}/games/${gameId}`).update({'turn.botAt':Date.now()-1});
+  await table(b,'timeout',{gameId,turn:g.turn.number});
+  g=await game(gameId);
+  assert.equal(g.state,'finished',JSON.stringify({log:g.log,seats:g.seats,turn:g.turn,draft:g.draft}));
+  assert.equal(g.result.winner,2);
+  assert.equal(g.result.pot,100,'two humans × 50');
+  assert.equal(g.result.taker,1);
+  assert.deepEqual(g.result.payouts,[0,90,0]);
+});
+
+// The host removes a player from the lobby (README.md, "Removing a player").
+test('removing a player: only the host, only in the lobby, and the code no longer lets them in',async()=>{
+  const {statsDay}=await import('../src/stats.js');
+  const day=db.doc(`tableStats/${env}/days/${statsDay()}`);
+  const before=(await day.get()).data() ?? {};
+  const a=player(key('5'),'פרפר'), b=player(key('6'),'דבורה'), c=player(key('7'),'חיפושית');
+  const made=await table(a,'create',{});
+  const gameId=made.gameId;
+  await table(b,'join',{code:made.code});
+  await table(c,'join',{code:made.code});
+  await fails(table(b,'kick',{gameId,player:id(c.playerKey)}),'permission-denied','Only the host');
+  await fails(table(a,'kick',{gameId,player:id(a.playerKey)}),'invalid-argument');
+  assert.deepEqual(await table(a,'kick',{gameId,player:id(b.playerKey)}).then(r=>r.removed),true);
+  let g=await game(gameId);
+  assert.deepEqual(g.seats.map(s=>s.nickname),['פרפר','חיפושית']);
+  assert.deepEqual(g.kicked,[id(b.playerKey)]);
+  const secret=(await db.doc(`tables/${env}/games/${gameId}/private/state`).get()).data();
+  assert.equal(secret.handIds.length,2,'the hand id goes with the seat');
+  await fails(table(b,'join',{code:made.code}),'permission-denied','removed');
+  await fails(table(b,'ready',{gameId,ready:true}),'permission-denied');
+  // In a game, nobody is removed: leaving is the player's own.
+  await table(c,'ready',{gameId,ready:true});
+  await table(a,'ready',{gameId,ready:true});
+  await table(a,'start',{gameId});
+  await fails(table(a,'kick',{gameId,player:id(c.playerKey)}),'failed-precondition');
+  g=await game(gameId);
+  assert.equal(g.seats.length,2);
+  const after=(await day.get()).data();
+  assert.equal((after.kicks ?? 0)-(before.kicks ?? 0),1);
 });

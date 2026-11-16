@@ -18,7 +18,7 @@ AGPL. The game's apps are separate programs that talk to this server.
 
 ## The rules in short
 
-- **Tiles:** 106 tiles: 104 Hebrew letters by how often Hebrew uses them, and 2 jokers. Each player gets 7–21 letters (14 by default).
+- **Tiles:** 106 tiles: 104 Hebrew letters by how often Hebrew uses them, and 2 jokers. Each player gets 12–21 letters (14 by default).
 - **Starting:** every seated player must mark themselves ready. Changing the table settings clears readiness. The host can start when at least two players are seated and all are ready; everyone sees a shared 3-second countdown before the first turn.
 - **Finals:** there are no final-form tiles. ך ם ן ף ץ show by themselves at the end of a word.
 - **Opening:** your first move must be worth at least 10 points of your own letters, in new words only.
@@ -74,6 +74,7 @@ Where the inputs come from:
 | `hewiktionary-latest-all-titles-in-ns0.gz` | [Wikimedia dumps](https://dumps.wikimedia.org/hewiktionary/latest/) |
 | `wikidata-forms.tsv` | A [Wikidata Query Service](https://query.wikidata.org/) export of `SELECT ?rep WHERE { ?l dct:language wd:Q9288; ontolex:lexicalForm ?f. ?f ontolex:representation ?rep. FILTER(LANG(?rep)="he") }` |
 | `he_full.txt` | FrequencyWords' `content/2018/he` |
+| `he_50k.txt` (the bots' common words, `scripts/build_common.py`) | FrequencyWords' `content/2018/he` |
 | `catalog.json` | The game's published catalog |
 
 The script prints the counts at each step and writes samples for review.
@@ -89,13 +90,73 @@ followed by their device key: only their own phone can work out that address.
 
 ## Diamonds
 
-A table can have a price. The game's settings (`gameTuning/{env}`, key `wordTable`: `stakes`, `freePlay`, `houseCut`)
+A table can have a price. The game's settings (`gameTuning/{env}`, key `wordTable`: `stakes`, `freePlay`, `houseCut`, `botPrice`)
 list the prices a host may pick and whether a free table is one of them. Every player pays when the game starts, and
 the winner takes the pot (price × seats) less the house's cut, rounded in the house's favour. A game with no winner
 gives each seat still at the table its price back. The diamonds themselves live on the phones, so every call carries
 the player's `balance`. A priced table refuses a join, a ready, the host's change of price, a start and "again" with
 `diamonds` when the balance is short, and with `update` when an older app sends none. The result carries `pot` and
 `payouts` (per seat). `tableTuning`, `chooseStake` and `payouts` in `src/table.js`.
+
+## Removing a player
+
+The host can remove another player from the lobby (`kick {gameId, player}`, the player's seat id). Their seat goes,
+and their id is kept in the table's `kicked` list, so the table's code refuses them from then on (`removed`). So
+do "again" into that lobby and a friend's invitation to it. Only the host can do this, never to themselves, and only
+in the lobby; during a game, leaving is the player's own choice. The player's app sees itself in `kicked` and says
+so. Each removal is counted as `kicks` in the daily statistics. The logic is `kickSeat` in `src/table.js`.
+
+## Bots
+
+The host can seat bots in the lobby (`addBot {gameId, level}`, `removeBot {gameId, bot}`, `botLevel {gameId, bot,
+level}`), up to the table's four seats. A bot is always ready, has a name of its own, and plays at a level from 1 to 5.
+Each change of bots clears the players' readiness, as a change of settings does.
+
+- **Where it plays:** on the server, so a phone that sleeps never stops it. There is no scheduler: when a bot's turn
+  comes, the table carries `turn.botAt`, and the phones at the table call `timeout` from then on (the call that already
+  ends a sleeping player's turn). The first call, 1.5 s into the turn, finds the bot's move and saves it as its `draft`
+  (with `bot: true` and a window, `from`–`until`, in which the phones show its letters arriving one at a time: 1.5 s
+  apart at level 1, 0.6 s at level 5). `botAt` then moves to when the move is played: the level's share of the clock
+  (`turn.botThink`), or later when the letters need longer, and always before the clock runs out. That call plays it,
+  logged as a `play`. A bot with no move draws a letter at its time. An app that knows nothing of bots still moves
+  them, late, at the end of the clock.
+- **The move finder** (`src/bots.js`): it finds new words in the hand's letters (one colour each, jokers filling in)
+  and letters from the hand added to a word on the board (which may be rearranged). It does not cut words or move
+  letters between words. Every move is checked by `checkPlay` like a player's, and a word StageAdmin denied is never
+  played.
+- **Common words only:** bots pick from `dictionary/common-he-v1.txt.gz`, not from the whole list, so they never play
+  a form that is legal but nobody uses (הצטערכן). It holds the full list's keys found in FrequencyWords' Hebrew
+  subtitle list (24,716 of them), most frequent first, built by `scripts/build_common.py`; the hand-added
+  `allow.txt` counts as common too. Each level takes the most frequent N, indexed by letters once per instance: 4,000
+  at level 1, 6,000 at 2, 10,000 at 3, 16,000 at 4 and all of them at level 5 (`botRules.pool`). An opening a level
+  cannot make from its own words tries all the common words before drawing. The full list still decides what is legal
+  for everyone, so the players are unaffected. Measured over 40 sample racks a setting, every level opens on its first
+  turn 100% of the time with 14 letters and no colours, 95% with 12 letters and 3 colours, and 85% with 12 letters
+  and 4 colours (the full list: 93%), and once open finds a play every time.
+- **The levels:**
+
+| Level | A turn | Longest word | Time it takes |
+|---|---|---|---|
+| 1 | its shortest word (about 3 letters) | 4 | about 70% of the clock |
+| 2 | one of its best three words, up to 5 letters | 5 | about 65% |
+| 3 | up to 2 moves, up to 8 letters | 5 | about 60% |
+| 4 | up to 3 moves, up to 11 letters | 6 | about 55% |
+| 5 | everything it can: the best of its best first moves of each length, followed through | 7 | about 50% |
+
+  Each turn varies the time by up to ±4% of the clock. "Longest word" counts a new word, or a word on the board with
+  the bot's letters added (`botRules.wordLength`). Every level makes the first-turn minimum when its letters allow:
+  the lower levels with the fewest letters that make it, and when words within the level's length cannot make it,
+  the length is lifted for that opening only.
+- **Diamonds:** bots never pay and never collect. The pot is the price × the human seats. A table of the host and bots
+  only costs the host a flat price instead (`gameTuning/{env}` key `wordTable`, `botPrice`, 0–1000, 10 by default),
+  paid at the start, with no pot. When a bot finishes first at a priced table, the human with the lowest hand still
+  at the table takes the pot less the cut (`stakeRules.botWin`; the result's `taker` says who).
+- **Votes:** bots do not vote, and against bots only there is nobody to ask (`no-voters`).
+- **The end:** when no human is left in a game, it ends.
+- **Statistics:** `botsAdded`, `botGames`, `botOnlyGames`, `botLevels.{1–5}`, `botPlays`, `botTiles`, `botDraws`,
+  `botWins`, `botTableDiamonds`. Bots are not counted under `platforms` or `diamondsStaked`.
+
+The function runs with 512 MiB for the index.
 
 ## Statistics
 
@@ -135,4 +196,5 @@ firebase deploy --only functions:table
 
 GNU Affero General Public License v3 only (see `LICENSE`).
 - **The dictionary:** derived from Hspell (AGPL v3), and includes data from Wikidata (CC0), Hebrew Wiktionary (CC-BY-SA 4.0) and FrequencyWords (CC-BY-SA 4.0), with thanks to all of them.
+- **The bots' common words** (`dictionary/common-he-v1.txt.gz`): derived from FrequencyWords by Hermit Dave (OpenSubtitles 2018, https://github.com/hermitdave/FrequencyWords), CC-BY-SA 4.0, and shared under the same licence.
 - **Running a changed version:** if you run a modified version of this server for others over a network, the AGPL asks you to offer them its source.

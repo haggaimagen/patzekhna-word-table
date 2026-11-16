@@ -24,7 +24,7 @@ const TILE=new Map(TILES.map(t=>[t.id,t]));
 export const tileOf=id=>TILE.get(id);
 
 export const tableRules={minPlayers:2,maxPlayers:4,minWordLength:3,openingPoints:10,timeoutPenalty:3,jokerHandPenalty:8,
-  rackSizes:[7,10,12,14,16,18,21],rackSize:14,turnSecondsOptions:[30,60,90,120],turnSeconds:60,
+  rackSizes:[12,14,16,18,21],rackSize:14,turnSecondsOptions:[30,60,90,120],turnSeconds:60,
   colorOptions:[1,2,3,4],colors:1,colorChance:0.5,
   lobbyMs:30*60_000,startDelayMs:3_000,graceMs:2_500,maxMissed:3,maxWords:60,maxWordTiles:24,logSize:30,
   voteMs:15_000,maxAsked:3};
@@ -43,12 +43,16 @@ export function tableSettings(input={},tuning=tableTuning(null)) {
 // the table's price when the game starts, and the winner takes the pot less the house's cut. Anything invalid falls
 // back to the defaults as a whole, as the apps do; with the diamonds switched off (`economy.enabled: false`) every
 // table is free.
-export const stakeRules={stakes:[20,50,100],freePlay:true,houseCut:10,maxStakes:5,maxStake:1000};
+export const stakeRules={stakes:[20,50,100],freePlay:true,houseCut:10,maxStakes:5,maxStake:1000,botPrice:10,
+  // A table with bots where a bot finishes first: the pot goes to the best human (the lowest hand among those still
+  // at the table), less the cut, as if that player had won. 'refund' would give each human still in their price back.
+  botWin:'bestHuman'};
 
 export function tableTuning(payload) {
-  if(payload?.economy?.enabled===false)return {stakes:[],freePlay:true,houseCut:0,options:[0]};
+  if(payload?.economy?.enabled===false)return {stakes:[],freePlay:true,houseCut:0,botPrice:0,options:[0]};
   const raw=payload?.wordTable;
   let tuning={stakes:stakeRules.stakes,freePlay:stakeRules.freePlay,houseCut:stakeRules.houseCut};
+  let botPrice=stakeRules.botPrice;
   if(raw && typeof raw==='object') {
     const stakes=raw.stakes ?? tuning.stakes, freePlay=raw.freePlay ?? tuning.freePlay, houseCut=raw.houseCut ?? tuning.houseCut;
     const valid=Array.isArray(stakes) && stakes.length<=stakeRules.maxStakes
@@ -56,8 +60,11 @@ export function tableTuning(payload) {
       && typeof freePlay==='boolean' && Number.isInteger(houseCut) && houseCut>=0 && houseCut<=100
       && (freePlay || stakes.length>0);
     if(valid)tuning={stakes,freePlay,houseCut};
+    // The price of a game against bots only stands apart: a bad value keeps its own default, not the prices'.
+    const bot=raw.botPrice ?? botPrice;
+    if(Number.isInteger(bot) && bot>=0 && bot<=stakeRules.maxStake)botPrice=bot;
   }
-  return {...tuning,options:[...(tuning.freePlay ? [0] : []),...tuning.stakes]};
+  return {...tuning,botPrice,options:[...(tuning.freePlay ? [0] : []),...tuning.stakes]};
 }
 
 // The price a host gets: the one they asked for if their diamonds cover it, otherwise the dearest they can pay up to
@@ -71,19 +78,35 @@ export function chooseStake(tuning,wanted,balance) {
   return below.length ? below[below.length-1] : can[0];
 }
 
-// What each seat gets back when the game ends. Every seat paid the price at the start (a leaver too), so the pot is
-// price × seats; the winner takes it less the house's cut (rounded in the house's favour). A game with no winner gives
-// each seat still at the table its own price back, with no cut.
-export function payouts(seats,stake,houseCut,winner) {
+// What each seat gets back when the game ends. Bots never pay and never collect (README.md, "Bots"), so the pot is
+// the price × the human seats, every one of which paid at the start (a leaver too). The winner takes it less the house's
+// cut (rounded in the house's favour). When a bot wins, the best human takes it instead (`stakeRules.botWin`). A game
+// with no winner gives each human still at the table their own price back, with no cut. A game against bots only
+// (`botTable`) has no pot: its price was the cost of the game.
+export function payouts(seats,stake,houseCut,winner,{values=[],botTable=false,botWin=stakeRules.botWin}={}) {
   const none=seats.map(()=>0);
-  if(!stake)return {pot:0,cut:0,payouts:none};
-  const pot=stake*seats.length;
-  if(winner==null) {
-    const back=seats.map(s=>s.left ? 0 : stake);
-    return {pot,cut:0,payouts:back};
+  if(!stake || botTable)return {pot:0,cut:0,taker:null,payouts:none};
+  const humans=seats.map((s,i)=>i).filter(i=>!seats[i].bot);
+  const pot=stake*humans.length;
+  let taker=winner;
+  if(taker!=null && seats[taker]?.bot) {
+    taker=null;
+    if(botWin==='bestHuman')for(const i of humans)
+      if(!seats[i].left && (taker==null || (values[i] ?? 0)<(values[taker] ?? 0)))taker=i;
   }
+  if(taker==null)return {pot,cut:0,taker:null,payouts:seats.map(s=>!s.bot && !s.left ? stake : 0)};
   const cut=Math.ceil(pot*houseCut/100);
-  return {pot,cut,payouts:none.map((n,i)=>i===winner ? pot-cut : 0)};
+  return {pot,cut,taker,payouts:none.map((n,i)=>i===taker ? pot-cut : 0)};
+}
+
+// The host removes a player from the lobby (README.md, "Removing a player"): their seat and hand id go, and their id
+// joins `kicked`, so the table's code refuses them from then on. Null when there is no such human seat (a bot is
+// removed with `removeBot`; the host cannot remove themselves).
+export function kickSeat(seats,handIds,kicked,id,host) {
+  if(id===host)return null;
+  const index=seats.findIndex(s=>!s.bot && s.id===id);
+  if(index<0)return null;
+  return {seats:seats.filter((s,i)=>i!==index),handIds:handIds.filter((h,i)=>i!==index),kicked:[...new Set([...(kicked ?? []),id])]};
 }
 
 export function shuffle(list,random=Math.random) {
