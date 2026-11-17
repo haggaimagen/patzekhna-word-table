@@ -9,6 +9,7 @@ import {initializeApp as adminApp,deleteApp as deleteAdminApp} from 'firebase-ad
 import {getFirestore} from 'firebase-admin/firestore';
 import {TILES} from '../src/table.js';
 import {inboxOf} from '../src/tableCallable.js';
+import {sweepGame} from '../src/tableSweep.js';
 
 if(!process.env.FIRESTORE_EMULATOR_HOST)throw Error('Emulator endpoints are required');
 const admin=adminApp({projectId:'patzekhna'},'table-integration');
@@ -144,6 +145,56 @@ test('two public joins racing for the last seat cannot overfill it',async()=>{
   const joins=await Promise.allSettled([first,second].map(who=>table(who,'joinPublic',{gameId:made.gameId})));
   assert.equal(joins.filter(result=>result.status==='fulfilled').length,1);
   assert.equal((await game(made.gameId)).seats.length,2);
+});
+
+test('a managed host has one active table and an expired table lease finishes a bot game',async()=>{
+  const host={...player(lobbyKey('lease-host'),'מארח חדש'),managed:true,balance:100};
+  const viewer=player(lobbyKey('lease-viewer'),'צופה חדש');
+  const made=await table(host,'create',{visibility:'public'});
+  await assert.rejects(table(host,'create',{visibility:'public'}),error=>
+    error.code==='functions/failed-precondition' && error.message.includes('active-room') &&
+    error.details?.gameId===made.gameId && error.details?.handId===made.handId);
+  await table(host,'addBot',{gameId:made.gameId});
+  await ready(host,made.gameId);
+  await table(host,'start',{gameId:made.gameId});
+  await table(host,'tablePulse',{gameId:made.gameId});
+  assert.equal((await game(made.gameId)).seats[0].leaseManaged,true);
+  assert.equal((await table(host,'browseLobby')).allRooms.some(room=>room.gameId===made.gameId),false,
+    'the player does not see their own active table in public browse');
+  const ref=db.doc(`tables/${env}/games/${made.gameId}`);
+  const current=await game(made.gameId);
+  await ref.update({seats:current.seats.map((seat,i)=>i===0 ? {...seat,tableUntilMs:Date.now()-1} : seat)});
+  assert.equal((await table(viewer,'browseLobby')).allRooms.some(room=>room.gameId===made.gameId),false);
+  await sweepGame(db,env,ref);
+  const finished=await game(made.gameId);
+  assert.equal(finished.state,'finished');
+  assert.equal(finished.discoverable,false);
+  assert.equal(finished.seats[0].left,true);
+  assert.equal(finished.result.reason,'abandoned');
+  const waiting=await table(host,'create',{visibility:'public'});
+  assert.equal((await game(waiting.gameId)).seats[0].leaseManaged,true);
+  const waitingRef=db.doc(`tables/${env}/games/${waiting.gameId}`);
+  const waitingGame=await game(waiting.gameId);
+  await waitingRef.update({seats:waitingGame.seats.map(seat=>({...seat,tableUntilMs:Date.now()-1}))});
+  await sweepGame(db,env,waitingRef);
+  assert.equal((await game(waiting.gameId)).state,'cancelled','a host who never returns closes a waiting room');
+  const next=await table(host,'create');
+  await table(host,'leave',{gameId:next.gameId});
+  assert.equal((await table(host,'create')).gameId.length>0,true,'an explicit leave releases the reservation');
+});
+
+test('a stalled legacy bot game disappears and is finished by the sweep',async()=>{
+  const host={...player(lobbyKey('legacy-stall'),'מארח ותיק'),balance:100};
+  const viewer=player(lobbyKey('legacy-viewer'),'צופה ותיק');
+  const made=await table(host,'create',{visibility:'public'});
+  await table(host,'addBot',{gameId:made.gameId});
+  await ready(host,made.gameId);
+  await table(host,'start',{gameId:made.gameId});
+  const ref=db.doc(`tables/${env}/games/${made.gameId}`);
+  await ref.update({'turn.endsAt':Date.now()-11*60_000});
+  assert.equal((await table(viewer,'browseLobby')).allRooms.some(room=>room.gameId===made.gameId),false);
+  await sweepGame(db,env,ref);
+  assert.equal((await game(made.gameId)).state,'finished');
 });
 
 // Puts chosen tiles in a seat's hand, swapping with the pool so the box stays whole.

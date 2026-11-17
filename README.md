@@ -190,6 +190,16 @@ Every write moves `expireAt` 30 days ahead on a table, its hands, its private st
 and its code; a player's inbox record keeps for a year. A Firestore TTL policy on
 `expireAt` deletes what has expired.
 
+New clients send `tablePulse` while a table is on screen. Its human seat has a
+five-minute lease; backgrounding stops renewal but allows a brief return. The
+`sweepTables` scheduled function runs each minute, drops expired seats, closes an
+empty lobby, and finishes a game when no humans remain. Older clients have no
+table lease: a turn stalled for ten minutes is hidden from lobby browsing and
+finished by the sweep. A full waiting room also requires an online host to stay
+listed. New clients persist failed `leave` calls and retry them before opening
+another table; `managed` calls reserve one active table per player and return
+the existing table and hand for a Resume or Leave choice.
+
 ## Running it
 
 ```bash
@@ -205,7 +215,7 @@ firebase emulators:exec --only functions,firestore "cd functions && FUNCTIONS_EM
 Deploy (the `table` codebase of the game's Firebase project):
 
 ```bash
-firebase deploy --only functions:table
+firebase deploy --only functions:table,functions:sweepTables
 ```
 
 ## License
