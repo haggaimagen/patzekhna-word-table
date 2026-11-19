@@ -668,3 +668,73 @@ test('removing a player: only the host, only in the lobby, and the code no longe
   const after=(await day.get()).data();
   assert.equal((after.kicks ?? 0)-(before.kicks ?? 0),1);
 });
+
+test('random invitations: who is asked, the host\'s rows, answers, limits and the full-room answer',async()=>{
+  const p=name=>player(lobbyKey(`random-${name}`),name);
+  const host=p('מזמין'), amit=p('עמית'), bar=p('בר'), gal=p('גל'), old=p('ישן'), browsing=p('גולש'), dana=p('דנה');
+  const online=async(who,extra={randomInvites:1,balance:100})=>
+    table(who,'presence',{mode:'open',session:createHash('md5').update(who.nickname).digest('hex'),...extra});
+  for(const who of [host,amit,bar,gal,dana])await online(who);
+  await online(old,{});
+  await online(browsing);
+  await table(browsing,'lobbyPresence',{mode:'open',session:'d'.repeat(32)});
+  const made=await table(host,'create',{});
+  const first=await table(host,'inviteRandom',{gameId:made.gameId});
+  assert.equal(first.sent,3,'up to 3, as many as the free seats');
+  let g=await game(made.gameId);
+  assert.equal(g.randomInvites.length,3);
+  assert.ok(g.randomInvites.every(r=>r.status==='pending' && r.expiresMs-r.sentMs===30_000));
+  const asked=new Set(g.randomInvites.map(r=>r.nickname));
+  assert.equal(asked.has('ישן') || asked.has('גולש') || asked.has('מזמין'),false,
+    'never an old app, a lobby browser or the host');
+  await fails(table(host,'inviteRandom',{gameId:made.gameId}),'failed-precondition','wait');
+  const inbox=async who=>(await db.doc(`tables/${env}/inboxes/${inboxOf(who.playerKey)}`).get()).get('random');
+  const invited=[amit,bar,gal,dana].filter(who=>asked.has(who.nickname));
+  const [a,b,c]=await Promise.all(invited.map(inbox)).then(list=>list.map((inv,i)=>({who:invited[i],inv})));
+  assert.equal(a.inv.from,'מזמין');
+  assert.equal(a.inv.kind,'random');
+
+  const joined=await table(a.who,'answerRandom',{gameId:made.gameId,slot:a.inv.slot,invite:a.inv.id,answer:'accept'});
+  assert.equal(joined.joined,true);
+  assert.equal((await game(made.gameId)).seats.length,2,'a private room seats the invited player');
+  assert.equal(await inbox(a.who),undefined,'the answered invitation leaves the inbox');
+  const rec=async who=>(await db.doc(`tables/${env}/players/${id(who.playerKey)}`).get()).data();
+  assert.deepEqual([(await rec(a.who)).randomDayCount,(await rec(a.who)).randomLastMs],[0,0],'accepting resets the limits');
+  await table(b.who,'answerRandom',{gameId:made.gameId,slot:b.inv.slot,invite:b.inv.id,answer:'decline'});
+  await table(c.who,'answerRandom',{gameId:made.gameId,slot:c.inv.slot,invite:c.inv.id,answer:'snooze'});
+  assert.ok((await rec(c.who)).randomOffUntilMs>Date.now()+23*60*60_000);
+  g=await game(made.gameId);
+  assert.deepEqual(g.randomInvites.map(r=>r.status).sort(),['declined','declined','joined']);
+  assert.equal((await rec(b.who)).randomDayCount,1,'a decline keeps the count');
+
+  // Try another player in a declined row: the one left is free; then nobody is.
+  const bRow=g.randomInvites.find(r=>r.slot===b.inv.slot);
+  const fourth=[amit,bar,gal,dana].find(who=>!asked.has(who.nickname));
+  const retry=await table(host,'inviteRandom',{gameId:made.gameId,slot:bRow.slot});
+  assert.equal(retry.sent,1);
+  g=await game(made.gameId);
+  assert.equal(g.randomInvites.find(r=>r.slot===bRow.slot).nickname,fourth.nickname,'the same row, another player');
+  const cRow=g.randomInvites.find(r=>r.slot===c.inv.slot);
+  await fails(table(host,'inviteRandom',{gameId:made.gameId,slot:cRow.slot}),'failed-precondition','nobody');
+  // The old invitation in a reused row is no longer the receiver's to accept.
+  const late=await table(b.who,'answerRandom',{gameId:made.gameId,slot:b.inv.slot,invite:b.inv.id,answer:'accept'});
+  assert.equal(late.joined,false);
+
+  // The full-room answer: the seat went to someone else before the join.
+  await table(host,'settings',{gameId:made.gameId,maxPlayers:3});
+  const d=await inbox(fourth);
+  await table(old,'join',{code:made.code});
+  const full=await table(fourth,'answerRandom',{gameId:made.gameId,slot:d.slot,invite:d.id,answer:'accept'});
+  assert.deepEqual([full.joined,full.reason],[false,'full']);
+  await db.doc(`tables/${env}/games/${made.gameId}`).update({randomInvitedMs:0});
+  await fails(table(host,'inviteRandom',{gameId:made.gameId}),'failed-precondition','full');
+
+  // The switch, and Home's line.
+  assert.deepEqual((await table(c.who,'randomSetting',{enabled:true})).random,{off:false,untilMs:0});
+  await table(c.who,'answerRandom',{gameId:made.gameId,slot:c.inv.slot,invite:c.inv.id,answer:'never'});
+  assert.equal((await rec(c.who)).randomOff,true);
+  const stats=(await db.doc(`tableStats/${env}/days/${new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Jerusalem'}).format(new Date())}`).get()).get('randomInvites');
+  assert.deepEqual([stats.sent,stats.accepted,stats.declined,stats.snoozed,stats.never,stats.unavailable,stats.presses,stats.retries],
+    [4,1,1,1,1,2,1,1]);
+  assert.equal(typeof (await table(host,'gamesToday')).games,'number');
+});

@@ -104,6 +104,48 @@ followed by their device key: only their own phone can work out that address.
 - `inviteFriend {gameId, friend}` adds an invitation (the code, who sent it, when it ends) to the friend's inbox, at most 10 a minute per sender.
 - `presence {mode, session}` publishes an app-wide foreground lease: `open` registers the player, `pulse` renews it, and `close` clears it on background. A lost close expires after 45 seconds. `friendPresence {friends}` returns only the IDs currently online; the apps check while the friend list or lobby is visible.
 
+**What players wear.** Calls that seat a player or open the lobby lease may carry `look: {badge, nameColor}` (cosmetic
+ids, slugs of up to 40 characters; `src/look.js`). It is kept on the seat and as the player's `lobbyLook`, and
+`browseLobby`'s `players` entries carry `badge` and `nameColor` when worn.
+
+## Random invitations
+
+A host can ask players they don't know, who are online right now, to their waiting room. The rules are in
+`src/randomInvites.js`; who is online goes through `src/presence.js` (today the `presence` lease, later a Realtime
+Database entry), so one file changes when presence moves.
+- **Presence.** Apps that take random invitations add `randomInvites: 1`, `busy` (a table or a duel on screen) and
+  their `balance` to `presence` (`open` and `pulse`), stored on `tables/{env}/players/{id}`. `open` answers with the
+  player's own choice, `random: {off, untilMs}`. Older apps send none of it and are never asked.
+- **`inviteRandom {gameId}`** (host, lobby): up to 3 players, as many as the free seats less the invitations still
+  waiting, once every 30 seconds (`wait`, with `retryInMs`). One query over the online players (60 at most), the
+  likeliest re-read in the transaction. **`inviteRandom {gameId, slot}`** asks one other player in place of a row that
+  declined or never answered (`nobody` when no one is free). A waiting room asks at most `wordTable.randomPerTable`
+players in all (the game settings, 15 by default, 0–100; `table-limit`); 0 turns the action off (`off`).
+- **Who may be asked:** online; an app that takes random invitations; not busy, not in רמילים' lobby
+  (`lobbyUntilMs`) and not seated at a table (`activeGameId`); not opted out; a balance that covers the room's price;
+  not the host, not seated, not removed from that room, not already asked by it; and at most 1 random invitation per
+  10 minutes and 5 a day (Israel day). Accepting one sets both counters back to zero.
+- **Delivery:** the invitation is `random` in the receiver's inbox, beside the friends' `invites` (written with merge,
+  so neither removes the other): `{id, kind: 'random', gameId, slot, from, badge?, nameColor?, players, maxPlayers,
+  stake, sentMs, expiresMs}` (`badge` and `nameColor`: what the host wears). 30 seconds to answer.
+- **The host's panel** is `randomInvites` on the table document, one row per invited player: `slot`, `nickname`,
+  `status` (`pending`, `joined`, `declined`, `timeout`, `missed`), `sentMs`, `expiresMs`, `answeredMs`; and
+  `randomInvitedMs`, the last press. No player ids. Who holds each slot is in the private state (`random`,
+  `randomTried`). A pending row past its time reads as no answer.
+- **`answerRandom {gameId, slot, invite, answer}`:** `accept` seats the player at once, a private room too, and
+  answers `{joined: true, gameId, handId, code}`, or `{joined: false, reason}` with `full`, `started`, `expired`,
+  `gone` or `diamonds`. `decline`; `snooze` (no random invitations for 24 hours); `never`; `timeout` (the popup ran
+  out). Each clears the inbox's `random`.
+- **`randomSetting {enabled}`:** the player's own switch, on again (which also ends a 24-hour pause) or off for good.
+- **Statistics:** the `randomInvites` map in the daily document: `sent`, `accepted`, `declined`, `timeouts`,
+  `snoozed`, `never`, `unavailable` (accepted too late), `presses`, `retries`, `empty` (a press that found nobody),
+  `turnedOn`, `turnedOff`.
+
+## Games today
+
+`gamesToday` answers `{games}`, today's `gamesStarted` from the daily statistics (Israel day), read at most once a
+minute per instance. The apps show "N משחקים שוחקו היום" on Home when N is more than 5.
+
 ## Diamonds
 
 A table can have a price. The game's settings (`gameTuning/{env}`, key `wordTable`: `stakes`, `freePlay`, `houseCut`, `botPrice`)

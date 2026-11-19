@@ -56,8 +56,17 @@ export const stakeRules={stakes:[20,50,100],freePlay:true,houseCut:10,maxStakes:
   // each human still in their price back.
   botWin:'house'};
 
+// How many random players one waiting room may invite in all (README.md, "Random invitations"), set in StageAdmin
+// (`wordTable.randomPerTable`, 0–100; 0 turns random invitations off). It stands apart like the bot price.
+export const randomPerTableRules={value:15,max:100};
+export function randomPerTable(raw) {
+  const n=raw?.randomPerTable;
+  return Number.isInteger(n) && n>=0 && n<=randomPerTableRules.max ? n : randomPerTableRules.value;
+}
+
 export function tableTuning(payload) {
-  if(payload?.economy?.enabled===false)return {stakes:[],freePlay:true,houseCut:0,botPrice:0,options:[0]};
+  const perTable=randomPerTable(payload?.wordTable);
+  if(payload?.economy?.enabled===false)return {stakes:[],freePlay:true,houseCut:0,botPrice:0,options:[0],randomPerTable:perTable};
   const raw=payload?.wordTable;
   let tuning={stakes:stakeRules.stakes,freePlay:stakeRules.freePlay,houseCut:stakeRules.houseCut};
   let botPrice=stakeRules.botPrice;
@@ -72,7 +81,7 @@ export function tableTuning(payload) {
     const bot=raw.botPrice ?? botPrice;
     if(Number.isInteger(bot) && bot>=0 && bot<=stakeRules.maxStake)botPrice=bot;
   }
-  return {...tuning,botPrice,options:[...(tuning.freePlay ? [0] : []),...tuning.stakes]};
+  return {...tuning,botPrice,options:[...(tuning.freePlay ? [0] : []),...tuning.stakes],randomPerTable:perTable};
 }
 
 // The price a host gets: the one they asked for if their diamonds cover it, otherwise the dearest they can pay up to

@@ -18,11 +18,16 @@ import {dictionaryVersion,withLists,listsFor} from './dictionary.js';
 import {statsDay,newTally,statsKey} from './stats.js';
 import {botRules,validLevel,thinkMs,findMove,isBotTable,botSeat,botReveal} from './bots.js';
 import {tableLeaseMs,visibleRoom,expiredSeat,finishTable} from './tableLifecycle.js';
+import {onlineByLease,onlinePlayers} from './presence.js';
+import {submittedLook,lookEntry} from './look.js';
+import {randomRules,answers,validSlot,validInvite,ineligible,afterSent,afterAccepted,settledRow,pendingRows,freeSeats,
+  retryable,shuffled,optOut} from './randomInvites.js';
 
 const actions=['create','join','settings','ready','start','draft','play','draw','timeout','leave','away','back','again',
   'presence','friendPresence',
   'ask','vote','settle','inviteFriend','addBot','removeBot','botLevel','kick',
-  'browseLobby','lobbyPresence','joinPublic','tablePulse'];
+  'browseLobby','lobbyPresence','joinPublic','tablePulse',
+  'inviteRandom','answerRandom','randomSetting','gamesToday'];
 // "The table has moved on", not a bad request: the app drops the move and follows the table.
 const stale=['stale','not-your-turn','not-playing','voting','starting'];
 
@@ -54,6 +59,21 @@ const presenceLeaseMs=45_000;
 const lobbyRoomsLimit=40;
 const lobbyVisitorsLimit=40;
 
+// Today's games for Home's line (README.md, "Games today"): one read a minute per instance, every time in the emulator.
+const todayCache=new Map();
+async function gamesToday(db,env) {
+  const day=statsDay();
+  const hit=todayCache.get(env);
+  if(hit && hit.day===day && Date.now()-hit.at<60_000 && process.env.FUNCTIONS_EMULATOR!=='true')return hit.games;
+  let games=0;
+  try {
+    const doc=await db.collection('tableStats').doc(env).collection('days').doc(day).get();
+    games=Number(doc.get('gamesStarted')) || 0;
+  } catch { games=hit?.games ?? 0; }
+  todayCache.set(env,{at:Date.now(),day,games});
+  return games;
+}
+
 // The game's settings for prices (table.js, `tableTuning`): read once a minute per instance, every time in the emulator.
 const tuningCache=new Map();
 async function tuningFor(db,env) {
@@ -71,6 +91,8 @@ async function tuningFor(db,env) {
 
 function seat(id,details,now,managed=false) {
   return {id,nickname:details.nickname,platform:details.platform,appVersion:details.appVersion,joinedMs:now,
+    // What the player wears, for the lobby's list (README.md, "Public players lobby"); builds before it send none.
+    ...(details.look ? {look:details.look} : {}),
     count:0,opened:false,ready:false,left:false,away:false,missed:0,score:null,value:null,
     ...(managed ? {leaseManaged:true,tableUntilMs:now+tableLeaseMs} : {})};
 }
@@ -90,7 +112,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
   const details=async()=>{
     let me;
     try { me=validatePlayerDetails(data); } catch(e) { throw new HttpsError('invalid-argument',e.message); }
-    return {...me,nickname:await boardNickname(env,player,me.nickname)};
+    const look=submittedLook(data.look);
+    return {...me,nickname:await boardNickname(env,player,me.nickname),...(look ? {look} : {})};
   };
   const gameRef=()=>{
     if(!validMatchID(data.gameId))throw new HttpsError('invalid-argument','Invalid table');
@@ -366,7 +389,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       if(game.visibility!=='public')throw new HttpsError('failed-precondition','private');
       const host=await tx.get(playerRef(game.host));
       const hostSeat=game.seats.find(s=>s.id===game.host);
-      if((host.get('onlineUntilMs') ?? 0)<=now || hostSeat?.away || !hostSeat || expiredSeat(hostSeat,now))
+      if(!onlineByLease(host.data(),now) || hostSeat?.away || !hostSeat || expiredSeat(hostSeat,now))
         throw new HttpsError('failed-precondition','unavailable');
     }
     if(game.seats.length>=maxSeats(game))throw new HttpsError('failed-precondition','full');
@@ -395,7 +418,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       !(game.kicked ?? []).includes(player));
     const hosts=[...new Set(candidates.filter(game=>game.state==='lobby').map(game=>game.host))];
     const hostDocs=hosts.length ? await db.getAll(...hosts.map(playerRef)) : [];
-    const online=new Set(hostDocs.filter(doc=>(doc.get('onlineUntilMs') ?? 0)>now).map(doc=>doc.id));
+    const online=new Set(hostDocs.filter(doc=>onlineByLease(doc.data(),now)).map(doc=>doc.id));
     const listed=candidates.filter(game=>visibleRoom(game,now,online.has(game.host)));
     const status=game=>game.state==='playing' ? 'playing' : joinable(game) ? 'available' : 'full';
     const priority={available:0,full:1,playing:2};
@@ -410,11 +433,12 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       status:status(game),
     }));
     const activeVisitors=visitorsPage.docs.filter(doc=>doc.id!==player).slice(0,lobbyVisitorsLimit);
-    const people=new Map(activeVisitors.map(doc=>[doc.id,{nickname:doc.get('lobbyNickname') ?? 'שחקן',busy:false}]));
+    const people=new Map(activeVisitors.map(doc=>[doc.id,{nickname:doc.get('lobbyNickname') ?? 'שחקן',busy:false,
+      ...lookEntry(doc.get('lobbyLook'))}]));
     // A seat in a public room is busy even before the game starts: its host is no longer browsing.
     for(const game of visible) {
       for(const seat of game.seats.filter(seat=>!seat.bot && !seat.left && seat.id!==player))
-        people.set(seat.id,{nickname:seat.nickname,busy:true,roomId:game.id});
+        people.set(seat.id,{nickname:seat.nickname,busy:true,roomId:game.id,...lookEntry(seat.look)});
     }
     const players=[...people.values()].sort((a,b)=>Number(a.busy)-Number(b.busy) ||
       a.nickname.localeCompare(b.nickname,'he'));
@@ -437,7 +461,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       if(data.mode==='open') {
         if(closed.includes(data.session))return {online:false};
         tx.set(ref,{lobbySession:data.session,lobbyUntilMs:now+presenceLeaseMs,
-          lobbyNickname:me.nickname,expireAt:Timestamp.fromMillis(now+playerKeepMs)},{merge:true});
+          lobbyNickname:me.nickname,...(me.look ? {lobbyLook:me.look} : {}),
+          expireAt:Timestamp.fromMillis(now+playerKeepMs)},{merge:true});
         return {online:true};
       }
       if(data.mode==='close') {
@@ -462,6 +487,10 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       throw new HttpsError('invalid-argument','Invalid presence');
     const ref=playerRef(player);
     let me=null;
+    // Apps that take random invitations say so, whether they are busy (a table or a duel on screen) and their balance;
+    // older apps send none of it and are never invited (README.md, "Random invitations").
+    const random=Number.isInteger(data.randomInvites) && data.randomInvites>=randomRules.version
+      ? {randomVersion:data.randomInvites,randomBusy:data.busy===true,...(balance===undefined ? {} : {balance})} : {};
     if(data.mode==='open') {
       try { me=validatePlayerDetails(data); }
       catch(e) { throw new HttpsError('invalid-argument',e.message); }
@@ -474,8 +503,8 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
         if(closed.includes(data.session))return {online:false};
         tx.set(ref,{inbox:inboxOf(data.playerKey),nickname:me.nickname,platform:me.platform,
           seenMs:now,expireAt:Timestamp.fromMillis(now+playerKeepMs),
-          presenceSession:data.session,onlineUntilMs:now+presenceLeaseMs},{merge:true});
-        return {online:true};
+          presenceSession:data.session,onlineUntilMs:now+presenceLeaseMs,...random},{merge:true});
+        return {online:true,random:optOut(old.data(),now)};
       }
       if(data.mode==='close') {
         const closedSessions=[...new Set([...closed,data.session])].slice(-8);
@@ -487,7 +516,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       }
       if(old.get('presenceSession')!==data.session || closed.includes(data.session))
         return {online:false};
-      tx.update(ref,{onlineUntilMs:now+presenceLeaseMs});
+      tx.update(ref,{onlineUntilMs:now+presenceLeaseMs,...random});
       return {online:true};
     }));
   }
@@ -499,7 +528,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
     const unique=[...new Set(ids)].filter(id=>id!==player);
     const docs=unique.length ? await db.getAll(...unique.map(playerRef)) : [];
     const now=Date.now();
-    return reply({online:docs.filter(doc=>(doc.get('onlineUntilMs') ?? 0)>now).map(doc=>doc.id)});
+    return reply({online:docs.filter(doc=>onlineByLease(doc.data(),now)).map(doc=>doc.id)});
   }
 
   // New clients renew only the table they actually have on screen. An old client has no leaseManaged seat;
@@ -936,8 +965,9 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       const old=((await tx.get(inboxRef)).get('invites') ?? []).filter(i=>i.expiresMs>now && i.gameId!==ref.id);
       const invite={id:randomBytes(9).toString('base64url'),gameId:ref.id,code:game.code,from:me.nickname,fromId:player,
         players:game.seats.length,sentMs:now,expiresMs:game.expiresMs ?? now+tableRules.lobbyMs};
+      // Merged, so a random invitation waiting beside them (`random`) stays.
       tx.set(inboxRef,{invites:[...old,invite].slice(-inviteRules.kept),updatedMs:now,
-        expireAt:Timestamp.fromMillis(invite.expiresMs+24*60*60_000)});
+        expireAt:Timestamp.fromMillis(invite.expiresMs+24*60*60_000)},{merge:true});
       tx.set(playerRef(player),{invitesSent:[...recent,now]},{merge:true});
       count('friendInvites');
       return {sent:true};
@@ -1002,6 +1032,185 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       count('kicks');
       return {removed:true};
     }));
+  }
+
+  // Random invitations (README.md, "Random invitations"). The host's button asks up to 3 online players (as many as
+  // the free seats, and no more than one press every 30 seconds); `slot` asks one other player in place of a row that
+  // declined or never answered. Who may be asked is decided here (randomInvites.js, `ineligible`), from the presence
+  // lease, the receiver's limits and opt-outs, and their balance for the room's price. The invitation lands in the
+  // receiver's inbox beside the friends' ones; the rows on the table document are the host's panel.
+  case 'inviteRandom': {
+    const me=await details();
+    await register(me);
+    const ref=gameRef();
+    const slot=data.slot;
+    if(slot!==undefined && !validSlot(slot))throw new HttpsError('invalid-argument','Invalid slot');
+    const {randomPerTable:perTable}=await tuningFor(db,env);
+    if(perTable===0)throw new HttpsError('failed-precondition','off');
+    // Read before the transaction: one query over the online players, re-checked one by one inside it.
+    const pool=shuffled(await onlinePlayers(root,Date.now(),randomRules.candidates));
+    const names=new Map();
+    return reply(await runTx(async tx=>{
+      const now=Date.now();
+      const t=await load(tx,ref);
+      const game=t.game;
+      if(game.host!==player)throw new HttpsError('permission-denied','Only the host');
+      if(game.state!=='lobby' || (game.expiresMs ?? 0)<=now)refuse('not-playing');
+      const before=game.randomInvites ?? [];
+      let rows=before.map(row=>settledRow(row,now));
+      const timedOut=rows.filter((row,i)=>row.status==='timeout' && before[i].status==='pending').length;
+      const tried=t.secret.randomTried ?? [];
+      let needed, index=-1;
+      if(slot) {
+        index=rows.findIndex(row=>row.slot===slot);
+        if(index<0)throw new HttpsError('not-found','No such invitation');
+        if(!retryable(rows[index]))throw new HttpsError('failed-precondition','answered');
+        needed=freeSeats(game,rows,now)>0 ? 1 : 0;
+      } else {
+        const wait=(game.randomInvitedMs ?? 0)+randomRules.cooldownMs-now;
+        if(wait>0)throw new HttpsError('failed-precondition','wait',{retryInMs:wait});
+        // A new batch keeps the invitations still waiting for an answer; the answered ones leave the panel.
+        rows=pendingRows(rows,now);
+        needed=Math.min(randomRules.perBatch,freeSeats(game,rows,now));
+      }
+      if(needed<=0)throw new HttpsError('failed-precondition','full');
+      if(tried.length>=perTable)throw new HttpsError('resource-exhausted','table-limit');
+      needed=Math.min(needed,perTable-tried.length);
+      const day=statsDay(now);
+      const rules={day,stake:game.settings.stake ?? 0,
+        excluded:new Set([player,...game.seats.map(s=>s.id),...(game.kicked ?? []),...tried])};
+      // The query's copies may be a few seconds old: the likeliest few are read again in the transaction.
+      const look=pool.filter(p=>!ineligible(p,now,rules)).slice(0,needed+4);
+      const docs=look.length ? await tx.getAll(...look.map(p=>playerRef(p.id))) : [];
+      const picked=docs.filter(doc=>doc.exists).map(doc=>({id:doc.id,...doc.data()}))
+        .filter(p=>!ineligible(p,now,rules)).slice(0,needed);
+      for(const p of picked)if(!names.has(p.id))names.set(p.id,await boardNickname(env,p.id,p.nickname));
+      const secretRandom={...(t.secret.random ?? {})};
+      const humans=game.seats.filter(s=>!s.bot).length;
+      const sent=picked.map(p=>{
+        const slotId=slot ?? `r${randomBytes(4).toString('hex')}`;
+        const invite=randomBytes(9).toString('base64url');
+        secretRandom[slotId]={player:p.id,invite};
+        const expiresMs=now+randomRules.answerMs;
+        tx.set(playerRef(p.id),afterSent(p,now,day),{merge:true});
+        tx.set(root.collection('inboxes').doc(p.inbox),{random:{id:invite,kind:'random',gameId:ref.id,slot:slotId,
+          from:me.nickname,...lookEntry(me.look),players:humans,maxPlayers:maxSeats(game),stake:game.settings.stake ?? 0,
+          sentMs:now,expiresMs},
+        updatedMs:now,expireAt:Timestamp.fromMillis(now+2*24*60*60_000)},{merge:true});
+        return {slot:slotId,nickname:names.get(p.id),status:'pending',sentMs:now,expiresMs};
+      });
+      if(slot) {
+        if(!sent.length)throw new HttpsError('failed-precondition','nobody');
+        rows[index]=sent[0];
+        count('randomInvites.retries');
+      } else {
+        rows=[...rows,...sent];
+        count('randomInvites.presses');
+        if(!sent.length)count('randomInvites.empty');
+      }
+      count('randomInvites.sent',sent.length);
+      count('randomInvites.timeouts',timedOut);
+      // An empty press still starts the 30 seconds: the next one looks through the online players again.
+      tx.update(ref,{randomInvites:rows,...(slot ? {} : {randomInvitedMs:now}),...stamp()});
+      if(sent.length)tx.set(t.privateRef,kept({...t.secret,random:secretRandom,randomTried:[...tried,...picked.map(p=>p.id)]}));
+      return {sent:sent.length,rows};
+    }));
+  }
+
+  // The receiver's answer: `accept` takes a seat at once (a private room too: the host asked); `decline`, `snooze`
+  // (no random invitations for 24 hours) and `never` say no; `timeout` is the popup running out. A join that finds the
+  // room full, started or gone answers `{joined:false, reason}`, so the phone can offer the lobby instead.
+  case 'answerRandom': {
+    const answer=data.answer;
+    if(!answers.includes(answer))throw new HttpsError('invalid-argument','Invalid answer');
+    if(!validSlot(data.slot) || !validInvite(data.invite))throw new HttpsError('invalid-argument','Invalid invitation');
+    const me=answer==='accept' ? await details() : null;
+    if(me)await register(me);
+    const ref=gameRef();
+    return reply(await runTx(async tx=>{
+      const now=Date.now();
+      const inboxRef=root.collection('inboxes').doc(inboxOf(data.playerKey));
+      const privateRef=ref.collection('private').doc('state');
+      const [doc,secretDoc,inboxDoc]=await tx.getAll(ref,privateRef,inboxRef);
+      const game=doc.exists ? doc.data() : null;
+      const secret=secretDoc.data() ?? {};
+      const held=secret.random?.[data.slot];
+      const mineToAnswer=game && held?.player===player && held.invite===data.invite;
+      const rows=[...(game?.randomInvites ?? [])];
+      const index=mineToAnswer ? rows.findIndex(row=>row.slot===data.slot) : -1;
+      const row=index>=0 ? rows[index] : null;
+      const waiting=row?.status==='pending';
+      const inTime=row && now<=row.expiresMs+randomRules.graceMs;
+      const mark=status=>{ rows[index]={...row,status,answeredMs:now}; };
+      const changes={};
+      let result={answered:answer};
+
+      if(answer==='snooze') { changes.randomOffUntilMs=now+randomRules.snoozeMs; count('randomInvites.snoozed'); }
+      if(answer==='never') { changes.randomOff=true; count('randomInvites.never'); }
+      if(answer!=='accept') {
+        if(waiting) {
+          const late=answer==='timeout' || !inTime;
+          mark(late ? 'timeout' : 'declined');
+          // A 24-hour or permanent no is counted as that (above), not as a plain decline.
+          if(late)count('randomInvites.timeouts');
+          else if(answer==='decline')count('randomInvites.declined');
+        }
+      } else {
+        const reason=!row ? (game?.state==='lobby' ? 'expired' : 'gone')
+          : !waiting ? (row.status==='timeout' ? 'expired' : row.status==='joined' ? 'joined' : 'gone')
+          : !inTime ? 'expired'
+          : game.state!=='lobby' || (game.expiresMs ?? 0)<=now ? 'started'
+          : (game.kicked ?? []).includes(player) ? 'gone'
+          : game.seats.length>=maxSeats(game) ? 'full'
+          : (game.settings.stake ?? 0)>0 && (balance===undefined || balance<game.settings.stake) ? 'diamonds'
+          : null;
+        if(reason) {
+          if(waiting) {
+            mark(reason==='expired' ? 'timeout' : 'missed');
+            count(reason==='expired' ? 'randomInvites.timeouts' : 'randomInvites.unavailable');
+          } else count('randomInvites.unavailable');
+          result={joined:false,reason,stake:game?.settings.stake ?? 0,balance};
+        } else {
+          // Seated at once, as a join by code would, with the receiver's limits back to zero.
+          await reserveActive(tx,ref.id,now);
+          const handId=newHandId();
+          const seats=[...game.seats.map(unready),seat(player,me,now,managed)];
+          mark('joined');
+          tx.update(ref,{seats,discoverable:discoverable({...game,seats}),randomInvites:rows,...stamp()});
+          tx.set(privateRef,kept({...secret,handIds:[...(secret.handIds ?? []),handId]}));
+          Object.assign(changes,afterAccepted());
+          count('joins');
+          count('randomInvites.accepted');
+          result={joined:true,gameId:ref.id,handId,code:game.code};
+        }
+      }
+      if(row && rows[index]!==row && !result.joined)tx.update(ref,{randomInvites:rows,...stamp()});
+      if(inboxDoc.get('random.id')===data.invite)tx.update(inboxRef,{random:FieldValue.delete()});
+      if(Object.keys(changes).length)
+        tx.set(playerRef(player),{...changes,expireAt:Timestamp.fromMillis(now+playerKeepMs)},{merge:true});
+      return result;
+    }));
+  }
+
+  // The player's own switch for random invitations: off for good, or on again (which also ends a 24-hour pause).
+  case 'randomSetting': {
+    if(typeof data.enabled!=='boolean')throw new HttpsError('invalid-argument','Invalid setting');
+    return reply(await runTx(async tx=>{
+      const now=Date.now();
+      const ref=playerRef(player);
+      const old=optOut((await tx.get(ref)).data(),now);
+      const wasOff=old.off || old.untilMs>0;
+      tx.set(ref,{...(data.enabled ? {randomOff:false,randomOffUntilMs:0} : {randomOff:true}),
+        expireAt:Timestamp.fromMillis(now+playerKeepMs)},{merge:true});
+      if(data.enabled && wasOff)count('randomInvites.turnedOn');
+      if(!data.enabled && !old.off)count('randomInvites.turnedOff');
+      return {random:data.enabled ? {off:false,untilMs:0} : {off:true,untilMs:0}};
+    }));
+  }
+
+  // Home's "N משחקים שוחקו היום": today's started games from the daily statistics, cached for a minute.
+  case 'gamesToday': {
+    return reply({games:await gamesToday(db,env)});
   }
 
   // "עוד משחק" after the end: the first to ask opens a new lobby with the same settings and points the old table to
