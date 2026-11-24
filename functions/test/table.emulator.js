@@ -398,16 +398,36 @@ test("StageAdmin's lists: a denied word is refused, an allowed one plays",async(
   await db.doc(`dictionaryLists/${env}`).delete();
 });
 
-test('friends: an invitation lands in the friend\'s own inbox with the code',async()=>{
+test('friends: approval is mutual, decline grants nothing, and only approved friends can invite',async()=>{
   const a=player(key('3'),'דבורה'), b=player(key('4'),'נחליאלי'), c=player(key('2'),'זר');
-  // b has been at a table before, so the server knows b's inbox.
-  const earlier=await table(b,'create',{});
-  await table(b,'leave',{gameId:earlier.gameId});
+  const aId=id(a.playerKey), bId=id(b.playerKey);
+  const mine=async who=>(await db.doc(`tables/${env}/inboxes/${inboxOf(who.playerKey)}`).get()).data() ?? {};
+  const met=await table(a,'create',{});
+  await table(b,'join',{code:met.code});
+  await fails(table(c,'requestFriend',{gameId:met.gameId,friend:bId}),'permission-denied');
+  await fails(table(a,'requestFriend',{gameId:met.gameId,friend:aId}),'invalid-argument');
+  await table(a,'requestFriend',{gameId:met.gameId,friend:bId});
+  await table(a,'requestFriend',{gameId:met.gameId,friend:bId});
+  let request=(await mine(b)).friendRequests[0];
+  assert.equal((await mine(b)).friendRequests.length,1,'repeat presses do not duplicate a request');
+  assert.equal(request.fromId,aId);
+  assert.equal((await mine(a)).outgoingRequests[0].toId,bId);
+  await table(b,'answerFriendRequest',{requestId:request.id,answer:'decline'});
+  assert.deepEqual((await mine(a)).friends ?? [],[]);
+  assert.deepEqual((await mine(b)).friends ?? [],[]);
+  await table(a,'requestFriend',{gameId:met.gameId,friend:bId});
+  request=(await mine(b)).friendRequests[0];
+  await table(b,'answerFriendRequest',{requestId:request.id,answer:'accept'});
+  assert.equal((await mine(a)).friends[0].id,bId);
+  assert.equal((await mine(b)).friends[0].id,aId);
+  assert.deepEqual((await mine(a)).outgoingRequests,[]);
+  assert.deepEqual((await mine(b)).friendRequests,[]);
+  await table(b,'leave',{gameId:met.gameId});
   const made=await table(a,'create',{});
   await fails(table(a,'inviteFriend',{gameId:made.gameId,friend:id(key('9').replace(/9/g,'1'))}),'not-found','unknown-friend');
   await fails(table(a,'inviteFriend',{gameId:made.gameId,friend:id(a.playerKey)}),'invalid-argument');
-  await table(a,'inviteFriend',{gameId:made.gameId,friend:id(b.playerKey)});
-  const inbox=(await db.doc(`tables/${env}/inboxes/${inboxOf(b.playerKey)}`).get()).data();
+  await table(a,'inviteFriend',{gameId:made.gameId,friend:bId});
+  const inbox=await mine(b);
   assert.equal(inbox.invites.length,1);
   assert.equal(inbox.invites[0].code,made.code);
   assert.equal(inbox.invites[0].from,'דבורה');
@@ -416,7 +436,12 @@ test('friends: an invitation lands in the friend\'s own inbox with the code',asy
   // Someone not at the table cannot invite from it.
   await fails(table(c,'inviteFriend',{gameId:made.gameId,friend:id(b.playerKey)}),'permission-denied');
   await table(b,'join',{code:made.code});
-  await fails(table(a,'inviteFriend',{gameId:made.gameId,friend:id(b.playerKey)}),'failed-precondition','seated');
+  await fails(table(a,'inviteFriend',{gameId:made.gameId,friend:bId}),'failed-precondition','seated');
+  await table(a,'removeFriend',{friend:bId});
+  assert.deepEqual((await mine(a)).friends,[]);
+  assert.deepEqual((await mine(b)).friends,[]);
+  await table(b,'leave',{gameId:made.gameId});
+  await fails(table(a,'inviteFriend',{gameId:made.gameId,friend:bId}),'permission-denied','not-friends');
   const g=await game(made.gameId);
   assert.ok(g.expireAt,'a table carries its expiry');
 });

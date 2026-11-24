@@ -101,7 +101,8 @@ A player can invite friends to a lobby without a code. Each player has an inbox,
 `tables/{env}/inboxes/{inbox}`, where `inbox` is the SHA-256 of `table-inbox:`
 followed by their device key: only their own phone can work out that address.
 - The server keeps which inbox belongs to which player id in `tables/{env}/players/{id}`, which no client reads. It writes it whenever the player opens or joins a table.
-- `inviteFriend {gameId, friend}` adds an invitation (the code, who sent it, when it ends) to the friend's inbox, at most 10 a minute per sender.
+- `requestFriend {gameId, friend}` sends a request only to a human player at the caller's table. The receiver sees it in-app and gets a push notification. `answerFriendRequest {requestId, answer}` approves or declines; approval writes the friendship to both inboxes. `removeFriend {friend}` revokes it for both players.
+- `inviteFriend {gameId, friend}` requires that approved friendship on both sides. It adds the lobby invitation (code, sender, expiry) to the friend's inbox, at most 10 a minute per sender, and sends a push. The apps suppress the OS invite alert in the foreground and show the existing inbox banner. A tap while offline opens the table link directly.
 - `presence {mode, session}` publishes an app-wide foreground lease: `open` registers the player, `pulse` renews it, and `close` clears it on background. A lost close expires after 45 seconds. `friendPresence {friends}` returns only the IDs currently online; the apps check while the friend list or lobby is visible.
 
 **What players wear.** Calls that seat a player or open the lobby lease may carry `look: {badge, nameColor}` (cosmetic

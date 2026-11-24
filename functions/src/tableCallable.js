@@ -9,6 +9,7 @@
 //   invites/{code}             a lobby's code → its table, while the lobby is open.
 import {createHash,randomBytes} from 'node:crypto';
 import {getFirestore,FieldValue,Timestamp} from 'firebase-admin/firestore';
+import {getMessaging} from 'firebase-admin/messaging';
 import {onCall,HttpsError} from 'firebase-functions/v2/https';
 import {validatePlayerDetails,validCode,validMatchID,makeCode} from './players.js';
 import {boardNickname} from './nicknames.js';
@@ -25,7 +26,7 @@ import {randomRules,answers,validSlot,validInvite,ineligible,afterSent,afterAcce
 
 const actions=['create','join','settings','ready','start','draft','play','draw','timeout','leave','away','back','again',
   'presence','friendPresence',
-  'ask','vote','settle','inviteFriend','addBot','removeBot','botLevel','kick',
+  'ask','vote','settle','requestFriend','answerFriendRequest','removeFriend','inviteFriend','addBot','removeBot','botLevel','kick',
   'browseLobby','lobbyPresence','joinPublic','tablePulse',
   'inviteRandom','answerRandom','randomSetting','gamesToday'];
 // "The table has moved on", not a bad request: the app drops the move and follows the table.
@@ -55,9 +56,25 @@ const kept=data=>({...data,expireAt:expireAt()});
 export const inboxOf=playerKey=>createHash('sha256').update(`table-inbox:${playerKey}`).digest('hex');
 const playerKeepMs=365*24*60*60_000;
 const inviteRules={perMinute:10,kept:10};
+const friendRules={perMinute:10,kept:20};
 const presenceLeaseMs=45_000;
 const lobbyRoomsLimit=40;
 const lobbyVisitorsLimit=40;
+
+// A request is always pushed. A table invitation is pushed too; the apps suppress its OS alert while in front and
+// show the existing live inbox banner. This avoids a stale presence lease losing an invitation after a force quit.
+async function sendSocialPush(db,env,recipient,kind,title,body,id,code,ttlSeconds) {
+  try {
+    const doc=await db.doc(`pushRegistrations/${env}/devices/${recipient}`).get();
+    const device=doc.data();
+    if(!device?.enabled || !device.fid || !['android','ios'].includes(device.platform))return;
+    const data={kind,title,body,id,...(code ? {code} : {})};
+    await getMessaging().send({token:device.fid,data,
+      ...(device.platform==='android' ? {android:{priority:'high',ttl:ttlSeconds*1000}} : {apns:{
+        headers:{'apns-expiration':String(Math.floor(Date.now()/1000)+ttlSeconds),'apns-priority':'10'},
+        payload:{aps:{alert:{title,body},sound:'default'}}}})});
+  } catch(error) { console.error('Table social push failed',env,kind,recipient,error); }
+}
 
 // Today's games for Home's line (README.md, "Games today"): one read a minute per instance, every time in the emulator.
 const todayCache=new Map();
@@ -937,6 +954,94 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
     }));
   }
 
+  // A player met at a table asks to be friends. Both sides' inboxes are the source of truth; a local button press
+  // never grants permission to invite. Requests and accepted friendships stay in the inbox until answered or removed.
+  case 'requestFriend': {
+    const me=await details();
+    await register(me);
+    const friend=data.friend;
+    if(typeof friend!=='string' || !/^[0-9a-f]{64}$/.test(friend) || friend===player)
+      throw new HttpsError('invalid-argument','Invalid friend');
+    const result=await runTx(async tx=>{
+      const now=Date.now();
+      const t=await load(tx,gameRef());
+      mine(t);
+      const target=t.game.seats.find(s=>s.id===friend && !s.bot);
+      if(!target)throw new HttpsError('permission-denied','Friend must be a player at this table');
+      const mineRef=root.collection('inboxes').doc(inboxOf(data.playerKey));
+      const targetDoc=await tx.get(playerRef(friend));
+      if(!targetDoc.exists || !targetDoc.get('inbox'))throw new HttpsError('not-found','unknown-friend');
+      const theirsRef=root.collection('inboxes').doc(targetDoc.get('inbox'));
+      const [mineDoc,theirsDoc,meDoc]=await tx.getAll(mineRef,theirsRef,playerRef(player));
+      if((mineDoc.get('friends') ?? []).some(f=>f.id===friend))return {sent:true,notify:false};
+      if((mineDoc.get('outgoingRequests') ?? []).some(r=>r.toId===friend))return {sent:true,notify:false};
+      const recent=(meDoc.get('friendRequestsSent') ?? []).filter(ms=>ms>now-60_000);
+      if(recent.length>=friendRules.perMinute)throw new HttpsError('resource-exhausted','too-many');
+      const pending=(theirsDoc.get('friendRequests') ?? []).filter(r=>r.fromId!==player);
+      if(pending.length>=friendRules.kept)throw new HttpsError('resource-exhausted','inbox-full');
+      const request={id:randomBytes(9).toString('base64url'),fromId:player,from:me.nickname,sentMs:now};
+      tx.set(theirsRef,{friendRequests:[...pending,request],expireAt:FieldValue.delete()},{merge:true});
+      tx.set(mineRef,{outgoingRequests:[...(mineDoc.get('outgoingRequests') ?? []).filter(r=>r.toId!==friend),
+        {toId:friend,sentMs:now}].slice(-friendRules.kept),expireAt:FieldValue.delete()},{merge:true});
+      tx.set(playerRef(player),{friendRequestsSent:[...recent,now]},{merge:true});
+      return {sent:true,notify:true,id:request.id};
+    });
+    if(result.notify)await sendSocialPush(db,env,friend,'table_friend_request','בקשת חברות ברמילים',
+      `${me.nickname} רוצה להוסיף אותך לחברים`,result.id,null,7*24*60*60);
+    return reply({sent:true});
+  }
+
+  case 'answerFriendRequest': {
+    const me=await details();
+    await register(me);
+    const id=data.requestId;
+    if(typeof id!=='string' || !/^[A-Za-z0-9_-]{12}$/.test(id) || !['accept','decline'].includes(data.answer))
+      throw new HttpsError('invalid-argument','Invalid friend request');
+    return reply(await runTx(async tx=>{
+      const now=Date.now();
+      const mineRef=root.collection('inboxes').doc(inboxOf(data.playerKey));
+      const mineDoc=await tx.get(mineRef);
+      const request=(mineDoc.get('friendRequests') ?? []).find(r=>r.id===id);
+      if(!request)return {answered:true};
+      const senderDoc=await tx.get(playerRef(request.fromId));
+      const senderInbox=senderDoc.get('inbox');
+      if(!senderInbox)throw new HttpsError('not-found','unknown-friend');
+      const theirsRef=root.collection('inboxes').doc(senderInbox);
+      const theirsDoc=await tx.get(theirsRef);
+      const mineChanges={friendRequests:(mineDoc.get('friendRequests') ?? []).filter(r=>r.id!==id),
+        outgoingRequests:(mineDoc.get('outgoingRequests') ?? []).filter(r=>r.toId!==request.fromId),
+        expireAt:FieldValue.delete()};
+      const theirChanges={outgoingRequests:(theirsDoc.get('outgoingRequests') ?? []).filter(r=>r.toId!==player),
+        friendRequests:(theirsDoc.get('friendRequests') ?? []).filter(r=>r.fromId!==player),
+        expireAt:FieldValue.delete()};
+      if(data.answer==='accept') {
+        mineChanges.friends=[{id:request.fromId,nickname:senderDoc.get('nickname') ?? request.from,addedMs:now},
+          ...(mineDoc.get('friends') ?? []).filter(f=>f.id!==request.fromId)];
+        theirChanges.friends=[{id:player,nickname:me.nickname,addedMs:now},
+          ...(theirsDoc.get('friends') ?? []).filter(f=>f.id!==player)];
+      }
+      tx.set(mineRef,mineChanges,{merge:true});
+      tx.set(theirsRef,theirChanges,{merge:true});
+      return {answered:true,accepted:data.answer==='accept'};
+    }));
+  }
+
+  case 'removeFriend': {
+    const friend=data.friend;
+    if(typeof friend!=='string' || !/^[0-9a-f]{64}$/.test(friend) || friend===player)
+      throw new HttpsError('invalid-argument','Invalid friend');
+    return reply(await runTx(async tx=>{
+      const mineRef=root.collection('inboxes').doc(inboxOf(data.playerKey));
+      const targetDoc=await tx.get(playerRef(friend));
+      const theirsRef=targetDoc.get('inbox') ? root.collection('inboxes').doc(targetDoc.get('inbox')) : null;
+      const [mineDoc,theirsDoc]=await tx.getAll(mineRef,...(theirsRef ? [theirsRef] : []));
+      tx.set(mineRef,{friends:(mineDoc.get('friends') ?? []).filter(f=>f.id!==friend),expireAt:FieldValue.delete()},{merge:true});
+      if(theirsRef)tx.set(theirsRef,{friends:(theirsDoc.get('friends') ?? []).filter(f=>f.id!==player),
+        expireAt:FieldValue.delete()},{merge:true});
+      return {removed:true};
+    }));
+  }
+
   // A friend asked to this lobby: the invitation lands in their inbox with the code, and their app shows it wherever
   // they are. Anyone seated may invite, while the table is still a lobby with a free seat. A friend the server has never
   // seen (no table yet) cannot be reached.
@@ -947,7 +1052,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
     const friend=data.friend;
     if(typeof friend!=='string' || !/^[0-9a-f]{64}$/.test(friend) || friend===player)
       throw new HttpsError('invalid-argument','Invalid friend');
-    return reply(await runTx(async tx=>{
+    const result=await runTx(async tx=>{
       const now=Date.now();
       const t=await load(tx,ref);
       mine(t);
@@ -956,22 +1061,32 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
       if(game.seats.some(s=>s.id===friend))throw new HttpsError('failed-precondition','seated');
       if((game.kicked ?? []).includes(friend))throw new HttpsError('failed-precondition','removed');
       if(game.seats.length>=maxSeats(game))throw new HttpsError('failed-precondition','full');
-      const [friendDoc,meDoc]=await tx.getAll(playerRef(friend),playerRef(player));
+      const mineInboxRef=root.collection('inboxes').doc(inboxOf(data.playerKey));
+      const [friendDoc,meDoc,mineInboxDoc]=await tx.getAll(playerRef(friend),playerRef(player),mineInboxRef);
       const inbox=friendDoc.get('inbox');
       if(!friendDoc.exists || typeof inbox!=='string')throw new HttpsError('not-found','unknown-friend');
+      if(!(mineInboxDoc.get('friends') ?? []).some(f=>f.id===friend))
+        throw new HttpsError('permission-denied','not-friends');
       const recent=(meDoc.get('invitesSent') ?? []).filter(ms=>ms>now-60_000);
       if(recent.length>=inviteRules.perMinute)throw new HttpsError('resource-exhausted','too-many');
       const inboxRef=root.collection('inboxes').doc(inbox);
-      const old=((await tx.get(inboxRef)).get('invites') ?? []).filter(i=>i.expiresMs>now && i.gameId!==ref.id);
+      const inboxDoc=await tx.get(inboxRef);
+      if(!(inboxDoc.get('friends') ?? []).some(f=>f.id===player))
+        throw new HttpsError('permission-denied','not-friends');
+      const old=(inboxDoc.get('invites') ?? []).filter(i=>i.expiresMs>now && i.gameId!==ref.id);
       const invite={id:randomBytes(9).toString('base64url'),gameId:ref.id,code:game.code,from:me.nickname,fromId:player,
         players:game.seats.length,sentMs:now,expiresMs:game.expiresMs ?? now+tableRules.lobbyMs};
       // Merged, so a random invitation waiting beside them (`random`) stays.
       tx.set(inboxRef,{invites:[...old,invite].slice(-inviteRules.kept),updatedMs:now,
-        expireAt:Timestamp.fromMillis(invite.expiresMs+24*60*60_000)},{merge:true});
+        expireAt:FieldValue.delete()},{merge:true});
       tx.set(playerRef(player),{invitesSent:[...recent,now]},{merge:true});
       count('friendInvites');
-      return {sent:true};
-    }));
+      return {sent:true,invite};
+    });
+    const ttl=Math.max(0,Math.ceil((result.invite.expiresMs-Date.now())/1000));
+    if(ttl>0)await sendSocialPush(db,env,friend,'table_invite','הזמנה לרמילים',
+      `${me.nickname} מזמין/ה אותך לשחק`,result.invite.id,result.invite.code,ttl);
+    return reply({sent:true});
   }
 
   // Bots in the lobby (README.md, "Bots"), the host's to add, remove and set the level of (1–5). A bot takes a seat
@@ -1096,7 +1211,7 @@ export const table=onCall({region:'europe-west1',maxInstances:10,memory:'512MiB'
         tx.set(root.collection('inboxes').doc(p.inbox),{random:{id:invite,kind:'random',gameId:ref.id,slot:slotId,
           from:me.nickname,...lookEntry(me.look),players:humans,maxPlayers:maxSeats(game),stake:game.settings.stake ?? 0,
           sentMs:now,expiresMs},
-        updatedMs:now,expireAt:Timestamp.fromMillis(now+2*24*60*60_000)},{merge:true});
+        updatedMs:now,expireAt:FieldValue.delete()},{merge:true});
         return {slot:slotId,nickname:names.get(p.id),status:'pending',sentMs:now,expiresMs};
       });
       if(slot) {
