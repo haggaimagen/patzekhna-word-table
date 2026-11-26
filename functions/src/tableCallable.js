@@ -63,16 +63,18 @@ const lobbyVisitorsLimit=40;
 
 // A request is always pushed. A table invitation is pushed too; the apps suppress its OS alert while in front and
 // show the existing live inbox banner. This avoids a stale presence lease losing an invitation after a force quit.
+// On iOS a request also wakes the app in the background (content-available), so the app icon's number counts it.
 async function sendSocialPush(db,env,recipient,kind,title,body,id,code,ttlSeconds) {
   try {
     const doc=await db.doc(`pushRegistrations/${env}/devices/${recipient}`).get();
     const device=doc.data();
     if(!device?.enabled || !device.fid || !['android','ios'].includes(device.platform))return;
     const data={kind,title,body,id,...(code ? {code} : {})};
+    const wake=kind==='table_friend_request' ? {'content-available':1} : {};
     await getMessaging().send({token:device.fid,data,
       ...(device.platform==='android' ? {android:{priority:'high',ttl:ttlSeconds*1000}} : {apns:{
         headers:{'apns-expiration':String(Math.floor(Date.now()/1000)+ttlSeconds),'apns-priority':'10'},
-        payload:{aps:{alert:{title,body},sound:'default'}}}})});
+        payload:{aps:{alert:{title,body},sound:'default',...wake}}}})});
   } catch(error) { console.error('Table social push failed',env,kind,recipient,error); }
 }
 
